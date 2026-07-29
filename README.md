@@ -107,6 +107,43 @@ centre while your edges generally are not, so for a bandpass or bandstop one of
 the two transitions comes out wider than requested. The report says whether
 each spec was actually met.
 
+## Arithmetic: floating or fixed point
+
+Both designs are carried out in double precision, but hardware rarely runs them
+that way. The **Arithmetic** panel chooses what the coefficients are finally
+stored as, and everything downstream — the plots, the report, both exports and
+the generated C — then describes the filter you would actually build rather
+than the one that was designed.
+
+- **Floating point (double)** uses the coefficients exactly as designed.
+- **Fixed point** rounds every coefficient to a signed two's-complement integer
+  of the chosen word length with an implied binary point, so the value used is
+  `integer × 2⁻ᶠ`, the format usually written Q(B−1−F).F.
+
+The binary point is placed automatically, as far left as the largest
+coefficient allows, since headroom that is not needed is resolution given away;
+untick the box to set it yourself. The panel reports the format, the resolution,
+the representable range and the largest rounding error, and says so loudly if
+anything had to be clipped to fit.
+
+Rounding is not free, and the point of showing it is that the cost is specific
+and visible:
+
+- **FIR.** The stopband floor rises and the equiripple property is gone — the
+  weighted error, which the exchange had flat at ±δ, now runs outside it. The
+  plot keeps the original design behind the quantized one, and the report gives
+  the per-band cost. Linear phase does survive: symmetric taps are equal to the
+  last bit, so they round identically.
+- **IIR.** The poles move, and the pole-zero panel shows where they were. A
+  short word on a sharp filter pushes one onto or outside the unit circle and
+  the filter becomes unstable, which the report calls out. Rounding also shifts
+  the passband gain, which peak-to-peak ripple does not reveal, so that is
+  reported separately.
+
+What is modelled is coefficient quantization only. The arithmetic in the
+datapath — rounding of products, accumulator width, overflow behaviour — is a
+separate question and is not simulated.
+
 ## Save C
 
 **Save C…** asks where to put it and writes a self-contained C file that
@@ -125,7 +162,9 @@ void   free_filter(t_ctx *ctx);
 or one delay line of `N` samples — and zeroes it; `process_sample` takes one
 sample and returns one filtered sample; `free_filter` gives the state back. The
 coefficients are a `static const` table in the file, printed to seventeen
-significant figures, so nothing rounds on the way out.
+significant figures, so nothing rounds on the way out. In fixed point the
+values printed are the rounded ones, and the CSV and header exports carry the
+stored integers and the binary point alongside them.
 
 The generated IIR code runs the same transposed direct form II in the same
 section order as `iir_core.sos_filter`, and a test compiles it and checks it
@@ -247,6 +286,11 @@ Two numerical details are worth knowing about, and each has a test:
 ```bash
 .venv/bin/python -m pytest -q
 ```
+
+`test_fixed_point.py` checks the quantization: that values land on the lattice,
+that the automatic binary point gives away no resolution, that linear phase
+survives rounding, that an FIR stopband floor rises as bits are removed, and
+that a short word can cost an IIR its stability.
 
 `test_remez.py` checks the exchange — agreement with `scipy.signal.remez` on a
 fine grid, the alternation and equiripple properties, tap symmetry, the four

@@ -14,7 +14,7 @@ import pytest
 
 tk = pytest.importorskip("tkinter")
 import iir_core as ii  # noqa: E402
-import remez_core as rz  # noqa: E402
+import fir_core as rz  # noqa: E402
 import remez_gui as gui  # noqa: E402
 
 
@@ -471,8 +471,11 @@ def build_and_run(tmp_path, source, samples):
     exe = tmp_path / "filter"
     src.write_text(source)
     build = subprocess.run(
+        # -ffp-contract=off keeps the compiler from fusing a multiply and an
+        # add into one FMA, which rounds once instead of twice and would put
+        # the C a few bits away from the same arithmetic done in numpy.
         [cc, "-std=c99", "-Wall", "-Wextra", "-pedantic", "-O2",
-         "-DFILTER_MAIN", "-o", str(exe), str(src), "-lm"],
+         "-ffp-contract=off", "-DFILTER_MAIN", "-o", str(exe), str(src), "-lm"],
         capture_output=True, text=True)
     assert build.returncode == 0, build.stderr
     assert build.stderr == "", build.stderr        # and without a single warning
@@ -556,3 +559,225 @@ def test_exports(app, tmp_path, monkeypatch):
 
     assert png.exists() and png.stat().st_size > 0
     assert os.path.getsize(png) > 5000
+
+
+# ------------------------------------------------------- fixed point arithmetic
+
+
+def go_fixed(app, bits=None, frac=None):
+    """Switch to fixed point, optionally forcing the format."""
+    app.arith.set(gui.ARITH_FIXED)
+    if bits is not None:
+        app.word_bits.set(bits)
+    if frac is not None:
+        app.auto_frac.set(False)
+        app.frac_bits.set(frac)
+    app._arith_changed()
+    return app.fixed
+
+
+def test_floating_point_is_the_default_and_quantizes_nothing(app):
+    assert app.arith.get() == gui.ARITH_FLOAT
+    assert app.fixed is None
+    assert app.eff is app.result
+    assert str(app.word_bits_widget["state"]) == "disabled"
+
+
+def test_fixed_point_rounds_the_taps_and_says_so(app):
+    q = go_fixed(app, 8)
+    assert q is not None and q.bits == 8
+    assert app.eff is not app.result
+    assert np.array_equal(app.eff.h, q.values)
+    assert np.array_equal(q.values, q.ints * 2.0 ** -q.frac_bits)
+    assert not np.allclose(app.eff.h, app.result.h)
+    assert q.qformat in app.arith_status.get()
+    assert q.qformat in report_text(app)
+
+
+def test_the_word_length_controls_wake_up_with_fixed_point(app):
+    assert str(app.word_bits_widget["state"]) == "disabled"
+    go_fixed(app, 12)
+    assert str(app.word_bits_widget["state"]) == "normal"
+    app.arith.set(gui.ARITH_FLOAT)
+    app._arith_changed()
+    assert str(app.word_bits_widget["state"]) == "disabled"
+    assert app.fixed is None
+
+
+def test_the_binary_point_spinbox_follows_the_automatic_choice(app):
+    q = go_fixed(app, 16)
+    assert app.auto_frac.get()
+    assert app.frac_bits.get() == q.frac_bits
+    assert str(app.frac_spin["state"]) == "disabled"
+    # Taking it over by hand is honoured.
+    forced = go_fixed(app, 16, frac=q.frac_bits - 3)
+    assert forced.frac_bits == q.frac_bits - 3
+    assert str(app.frac_spin["state"]) == "normal"
+
+
+def test_narrower_words_cost_stopband_attenuation(app):
+    ideal = app.result.band_deviation[1]
+    floors = []
+    for bits in (8, 12, 16):
+        go_fixed(app, bits)
+        floors.append(app.eff.band_deviation[1])
+    assert floors[0] > floors[1] > floors[2] >= ideal * 0.999
+    assert floors[0] > 2 * ideal
+
+
+def test_the_report_shows_what_rounding_cost(app):
+    go_fixed(app, 8)
+    text = report_text(app)
+    assert "cost of rounding, per band" in text
+    assert "as built, after rounding the taps" in text
+    assert "datapath rounding is not modelled" in text
+    # The coefficient listing gains the integers actually stored.
+    assert str(int(app.fixed.ints[0])) in text
+
+
+def test_a_forced_binary_point_that_saturates_is_flagged(app):
+    q = go_fixed(app, 8, frac=12)         # far too far left for these taps
+    assert q.saturated > 0
+    assert "saturated" in app.arith_status.get()
+    assert "saturated" in report_text(app)
+
+
+def test_quantization_survives_a_redesign(app):
+    go_fixed(app, 10)
+    app.numtaps.set(51)
+    app.design()                          # a fresh design, still fixed point
+    assert app.fixed is not None
+    assert app.result.numtaps == 51
+    assert app.eff.h.size == 51
+    assert np.array_equal(app.eff.h, app.fixed.values)
+
+
+def test_switching_arithmetic_does_not_redesign(app):
+    before = app.result
+    go_fixed(app, 12)
+    assert app.result is before           # the same design object, re-rounded
+    app.arith.set(gui.ARITH_FLOAT)
+    app._arith_changed()
+    assert app.result is before
+    assert app.eff is before
+
+
+def test_the_plot_shows_the_ideal_response_alongside(app):
+    app.redraw()
+    labels = [ln.get_label() for ln in app.ax_mag.get_lines()]
+    assert not any("ideal" in str(x) for x in labels)
+    go_fixed(app, 8)
+    labels = [ln.get_label() for ln in app.ax_mag.get_lines()]
+    assert any("ideal" in str(x) for x in labels)
+    assert any("8-bit" in str(x) for x in labels)
+
+
+def test_a_bad_word_length_is_reported_not_raised(app):
+    app.arith.set(gui.ARITH_FIXED)
+    app.word_bits.set(1)                  # below the minimum
+    app._arith_changed()
+    assert app.fixed is None
+    assert app.eff is app.result          # falls back to the design itself
+    assert "not quantized" in app.arith_status.get()
+
+
+def test_fixed_point_applies_to_the_iir_sections_too(iir):
+    q = go_fixed(iir, 10)
+    assert q.ints.shape == iir.iir_result.sos.shape
+    assert np.all(q.values[:, 3] == 1.0)              # a0 left alone
+    assert np.array_equal(iir.eff.sos, q.values)
+    assert not np.allclose(iir.eff.sos, iir.iir_result.sos)
+    text = report_text(iir)
+    assert q.qformat in text
+    assert "passband ripple" in text
+
+
+def test_rounding_moves_the_iir_poles(iir):
+    before = iir.iir_result.max_pole_radius
+    go_fixed(iir, 8)
+    assert iir.eff.max_pole_radius != before
+    assert f"was {before:.6f}" in report_text(iir)
+    labels = [ln.get_label() for ln in iir.ax_pz.get_lines()]
+    assert any("before rounding" in str(x) for x in labels)
+
+
+def test_an_unstable_quantized_iir_is_called_out(iir):
+    # Narrow band, high order, poles hard against the unit circle.
+    iir.response.set("Lowpass")
+    iir.iir_wp[0].set("0.02")
+    iir.iir_ws[0].set("0.03")
+    iir.iir_rp.set("0.1")
+    iir.iir_rs.set("80")
+    iir.design()
+    assert iir.iir_result.stable
+    go_fixed(iir, 8)
+    assert not iir.eff.stable
+    text = report_text(iir)
+    assert "UNSTABLE" in text
+    assert "outside the unit circle" in text
+
+
+def test_exports_carry_the_integers_and_the_format(app, tmp_path, monkeypatch):
+    go_fixed(app, 12)
+    csv = tmp_path / "q.csv"
+    header = tmp_path / "q.h"
+    source = tmp_path / "q.c"
+    for path in (csv, header, source):
+        monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                            lambda p=path, **kw: str(p))
+        app.save_c_source() if path.suffix == ".c" else app.save_coefficients()
+
+    text = csv.read_text()
+    assert f"Q{app.fixed.int_bits}.{app.fixed.frac_bits}" in text
+    rows = [r for r in text.splitlines() if not r.startswith(("#", "n,"))]
+    assert [int(r.split(",")[2]) for r in rows] == [int(v) for v in app.fixed.ints]
+    # The exported doubles are the rounded ones, not the design's.
+    assert np.allclose([float(r.split(",")[1]) for r in rows], app.eff.h, atol=0)
+
+    head = header.read_text()
+    assert f"#define FIR_FRAC_BITS {app.fixed.frac_bits}" in head
+    assert "fir_coeffs_q" in head
+
+    c = source.read_text()
+    assert "fixed point" in c
+    assert f"{app.eff.h[0]: .17g}" in c
+
+
+def test_the_generated_c_runs_the_rounded_taps(app, tmp_path, monkeypatch):
+    go_fixed(app, 8)
+    source = save_c(app, tmp_path / "q.c", monkeypatch)
+    x = np.random.default_rng(5).standard_normal(200)
+    got = build_and_run(tmp_path, source, x)
+    assert np.allclose(got, np.convolve(x, app.eff.h)[:len(x)], atol=1e-12)
+    # and that is measurably not the unrounded design
+    assert not np.allclose(got, np.convolve(x, app.result.h)[:len(x)], atol=1e-9)
+
+
+def test_the_passband_panel_keeps_a_shifted_curve_in_frame(iir):
+    iir.load_iir_preset("Elliptic lowpass")
+    iir.design()
+    go_fixed(iir, 10)
+    lo, hi = iir.ax_idetail.get_ylim()
+    curves = [ln.get_ydata() for ln in iir.ax_idetail.get_lines()
+              if len(ln.get_ydata()) > 2]
+    assert curves, "the passband response was not drawn"
+    shown = np.concatenate(curves)
+    shown = shown[np.isfinite(shown)]
+    assert shown.min() >= lo and shown.max() <= hi
+    assert hi > 0.8 * iir.eff.rp                 # the spec lines stay visible too
+
+
+def test_a_gain_shift_from_rounding_is_reported(iir):
+    iir.load_iir_preset("Elliptic lowpass")
+    iir.design()
+    go_fixed(iir, 10)
+    shift = gui.RemezApp._passband_gain_shift(iir.iir_result, iir.eff)
+    assert abs(shift) > 0.1                      # this one moves about a dB
+    assert "passband gain" in report_text(iir)
+    assert f"{shift:+.3g} dB" in report_text(iir)
+
+
+def test_no_gain_shift_is_claimed_in_floating_point(iir):
+    assert gui.RemezApp._passband_gain_shift(iir.iir_result,
+                                             iir.iir_result) == pytest.approx(0.0)
+    assert "passband gain" not in report_text(iir)

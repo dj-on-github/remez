@@ -24,12 +24,16 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
-import iir_core as ii
 import fir_core as rz
+import fixed_point as fp
+import iir_core as ii
 
 MODE_FIR = "FIR — Remez exchange"
 MODE_IIR = "IIR — bilinear transform"
 MODES = [MODE_FIR, MODE_IIR]
+
+ARITH_FLOAT = "float"
+ARITH_FIXED = "fixed"
 
 VIEW_PLOT = "Plot view"
 VIEW_DESIGN = "Design view"
@@ -163,6 +167,17 @@ class RemezApp:
         self.mode = tk.StringVar(value=MODE_FIR)
         self.view = tk.StringVar(value=VIEW_PLOT)
 
+        # Arithmetic: the design is always carried out in double precision, and
+        # the coefficients are rounded onto the chosen word length afterwards.
+        # self.eff is what the filter actually is once that has happened, and is
+        # what every plot, report and export works from.
+        self.arith = tk.StringVar(value=ARITH_FLOAT)
+        self.word_bits = tk.IntVar(value=16)
+        self.auto_frac = tk.BooleanVar(value=True)
+        self.frac_bits = tk.IntVar(value=15)
+        self.fixed = None
+        self.eff = None
+
         paned = ttk.PanedWindow(root, orient="horizontal")
         paned.pack(fill="both", expand=True)
 
@@ -205,7 +220,7 @@ class RemezApp:
         """Mode selector, the two mode panels, and the shared bottom half."""
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
-        parent.rowconfigure(4, weight=1)
+        parent.rowconfigure(5, weight=1)
 
         sel = ttk.Frame(parent)
         sel.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -224,13 +239,63 @@ class RemezApp:
         self._build_iir_controls(self.iir_panel)
         self.iir_panel.grid_remove()
 
+        self._build_arithmetic(parent)
         self._build_actions(parent)
         self._build_display(parent)
         self._build_report(parent)
 
+    def _build_arithmetic(self, parent):
+        """Floating point, or a fixed-point word length to quantize onto."""
+        box = ttk.LabelFrame(parent, text="Arithmetic", padding=6)
+        box.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        box.columnconfigure(4, weight=1)
+
+        ttk.Radiobutton(box, text="Floating point (double)", value=ARITH_FLOAT,
+                        variable=self.arith, command=self._arith_changed
+                        ).grid(row=0, column=0, columnspan=5, sticky="w")
+        ttk.Radiobutton(box, text="Fixed point", value=ARITH_FIXED,
+                        variable=self.arith, command=self._arith_changed
+                        ).grid(row=1, column=0, sticky="w")
+
+        self.fixed_widgets = []
+        ttk.Label(box, text="word").grid(row=1, column=1, sticky="e", padx=(8, 2))
+        w = ttk.Spinbox(box, from_=fp.MIN_BITS, to=fp.MAX_BITS, width=4,
+                        textvariable=self.word_bits, command=self._arith_changed)
+        w.grid(row=1, column=2, sticky="w")
+        ttk.Label(box, text="bits").grid(row=1, column=3, sticky="w", padx=(2, 0))
+        self.fixed_widgets.append(w)
+        self.word_bits_widget = w
+
+        c = ttk.Checkbutton(box, text="place the binary point automatically",
+                            variable=self.auto_frac, command=self._arith_changed)
+        c.grid(row=2, column=0, columnspan=5, sticky="w", pady=(2, 0))
+        self.fixed_widgets.append(c)
+
+        ttk.Label(box, text="fraction").grid(row=3, column=1, sticky="e", padx=(8, 2))
+        f = ttk.Spinbox(box, from_=-64, to=64, width=4, textvariable=self.frac_bits,
+                        command=self._arith_changed)
+        f.grid(row=3, column=2, sticky="w")
+        ttk.Label(box, text="bits").grid(row=3, column=3, sticky="w", padx=(2, 0))
+        self.fixed_widgets.append(f)
+        self.frac_spin = f
+
+        self.arith_status = tk.StringVar(value="")
+        ttk.Label(box, textvariable=self.arith_status, foreground="#555",
+                  justify="left").grid(row=4, column=0, columnspan=5, sticky="w",
+                                       pady=(4, 0))
+        self._sync_arith_widgets()
+
+    def _sync_arith_widgets(self):
+        """Grey out the word-length controls unless fixed point is selected."""
+        fixed = self.is_fixed()
+        for w in self.fixed_widgets:
+            w.configure(state="normal" if fixed else "disabled")
+        if fixed and self.auto_frac.get():
+            self.frac_spin.configure(state="disabled")
+
     def _build_actions(self, parent):
         act = ttk.Frame(parent)
-        act.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        act.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(act, text="Design  (Ctrl+Enter)", command=self.design).pack(side="left")
         ttk.Button(act, text="Save coefficients…",
                    command=self.save_coefficients).pack(side="left", padx=4)
@@ -240,7 +305,7 @@ class RemezApp:
 
     def _build_display(self, parent):
         opt = ttk.LabelFrame(parent, text="Display", padding=6)
-        opt.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        opt.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         self.log_scale = tk.BooleanVar(value=True)
         self.show_spec = tk.BooleanVar(value=True)
         self.show_ext = tk.BooleanVar(value=True)
@@ -255,7 +320,7 @@ class RemezApp:
 
     def _build_report(self, parent):
         rbox = ttk.LabelFrame(parent, text="Result", padding=6)
-        rbox.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
+        rbox.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
         rbox.columnconfigure(0, weight=1)
         rbox.rowconfigure(0, weight=1)
         self.report = tk.Text(rbox, width=44, height=14, wrap="none",
@@ -631,6 +696,59 @@ class RemezApp:
                                  weight_kind="inv_f" if inv else "const"))
         return bands
 
+    def is_fixed(self):
+        return self.arith.get() == ARITH_FIXED
+
+    def _apply_arithmetic(self):
+        """Quantize the current design onto the chosen word length.
+
+        Leaves ``self.eff`` as the design itself in floating point mode, and as
+        a re-analysed copy carrying the rounded coefficients in fixed point.
+        """
+        res = self.iir_result if self.is_iir() else self.result
+        self.fixed = None
+        self.eff = res
+        self._sync_arith_widgets()
+        if res is None:
+            self.arith_status.set("")
+            return
+        if not self.is_fixed():
+            self.arith_status.set("coefficients used exactly as designed")
+            return
+
+        try:
+            bits = int(self.word_bits.get())
+            frac = None if self.auto_frac.get() else int(self.frac_bits.get())
+            if self.is_iir():
+                self.fixed = fp.quantize_sos(res.sos, bits, frac)
+                self.eff = ii.with_sos(res, self.fixed.values)
+            else:
+                self.fixed = fp.quantize(res.h, bits, frac)
+                self.eff = rz.with_taps(res, self.fixed.values)
+        except (fp.FixedPointError, rz.RemezError, ii.IIRError,
+                ValueError, tk.TclError) as exc:
+            self.fixed = None
+            self.eff = res
+            self.arith_status.set(f"not quantized: {exc}")
+            return
+
+        q = self.fixed
+        if self.auto_frac.get():
+            self.frac_bits.set(q.frac_bits)
+        lo, hi = q.limits
+        self.arith_status.set(
+            f"{q.qformat}   step {q.step:.3g}   "
+            f"range [{lo * q.step:g}, {hi * q.step:g}]\n"
+            f"largest coefficient error {q.max_error:.3g}"
+            + (f"   ***  {q.saturated} saturated  ***" if q.saturated else ""))
+
+    def _arith_changed(self, *_):
+        """An arithmetic control moved: requantize, but do not redesign."""
+        self._apply_arithmetic()
+        if self.eff is not None:
+            self.redraw()
+            self._report()
+
     def design(self, *_):
         if self.is_iir():
             return self.design_iir()
@@ -648,8 +766,10 @@ class RemezApp:
             )
         except (rz.RemezError, ValueError, tk.TclError) as exc:
             self.result = None
+            self._apply_arithmetic()
             self._fail(str(exc))
             return
+        self._apply_arithmetic()
         self.redraw()
         self._report()
 
@@ -663,10 +783,12 @@ class RemezApp:
             )
         except (ii.IIRError, ValueError, tk.TclError) as exc:
             self.iir_result = None
+            self._apply_arithmetic()
             self._fail(str(exc))
             return
         if self.auto_order.get():
             self.iir_order.set(self.iir_result.order)
+        self._apply_arithmetic()
         self.redraw()
         self._report()
 
@@ -706,21 +828,30 @@ class RemezApp:
         res = self.result
         if res is None:
             return
+        eff = self.eff if self.eff is not None else res
+        quantized = self.fixed is not None
         nyq = res.fs / 2.0
         f = np.linspace(0.0, nyq, 4096)
-        amp = rz.amplitude_response(res.h, 2 * np.pi * f / res.fs, res.symmetry)
+        amp = rz.amplitude_response(eff.h, 2 * np.pi * f / res.fs, res.symmetry)
         log = self.log_scale.get()
 
         # ---- amplitude ---------------------------------------------------
         ax = self.ax_mag
         ax.clear()
+        if quantized:
+            # The design it was rounded from, to show what the word length cost.
+            ideal = rz.amplitude_response(res.h, 2 * np.pi * f / res.fs, res.symmetry)
+            ax.plot(f, db(ideal) if log else ideal, lw=0.9, color="0.6", ls="-",
+                    label="ideal (double)", zorder=2)
         y = db(amp) if log else amp
-        ax.plot(f, y, lw=1.2, color="#1f77b4", label="designed response", zorder=3)
+        ax.plot(f, y, lw=1.2, color="#1f77b4", zorder=3,
+                label=f"{self.fixed.bits}-bit coefficients" if quantized
+                else "designed response")
 
         if self.show_spec.get():
             self._draw_constraints(ax, res, log)
         if self.show_ext.get():
-            ea = rz.amplitude_response(res.h, 2 * np.pi * res.extremal_f / res.fs,
+            ea = rz.amplitude_response(eff.h, 2 * np.pi * res.extremal_f / res.fs,
                                        res.symmetry)
             ax.plot(res.extremal_f, db(ea) if log else ea, "o", ms=3.5,
                     color="#d62728", label="extremal frequencies", zorder=4)
@@ -738,7 +869,8 @@ class RemezApp:
         ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
         ax.set_title(f"Type {res.ftype} {res.symmetry} FIR, N = {res.numtaps}"
                      f"   —   {res.iterations} iterations"
-                     f"{'' if res.converged else '  (did not converge)'}")
+                     f"{'' if res.converged else '  (did not converge)'}"
+                     + (f"   —   {self.fixed.qformat} coefficients" if quantized else ""))
 
         # ---- passband detail ----------------------------------------------
         self._draw_detail(self.ax_detail, res, f, amp)
@@ -747,28 +879,36 @@ class RemezApp:
         ax = self.ax_err
         ax.clear()
         for sl in self._segment_slices(res):
-            ax.plot(res.grid_f[sl], res.grid_e[sl], lw=1.0, color="#2ca02c")
+            ax.plot(res.grid_f[sl], eff.grid_e[sl], lw=1.0, color="#2ca02c")
         d = abs(res.delta)
         ax.axhline(d, color="#888", ls="--", lw=0.9)
         ax.axhline(-d, color="#888", ls="--", lw=0.9)
         if self.show_ext.get():
-            ax.plot(res.extremal_f, res.extremal_e, "o", ms=3.5, color="#d62728")
+            ax.plot(res.extremal_f, eff.extremal_e, "o", ms=3.5, color="#d62728")
         ax.set_xlim(0, nyq)
-        ax.set_ylim(-1.6 * d if d else -1, 1.6 * d if d else 1)
+        # Rounding the taps breaks the equiripple property, and the error then
+        # runs outside the +-delta the exchange achieved; keep both in frame.
+        reach = max(d, float(np.abs(eff.grid_e).max())) if d or eff.grid_e.size else 1.0
+        ax.set_ylim(-1.6 * reach, 1.6 * reach)
         ax.set_ylabel("weighted error")
         ax.set_xlabel("frequency")
         ax.grid(alpha=0.3)
-        ax.set_title(f"W(f)·[D(f) − A(f)]   —   "
-                     f"δ = {d:.4g}", fontsize=9)
+        ax.set_title(f"W(f)·[D(f) − A(f)]   —   δ = {d:.4g}"
+                     + (f", peak {np.abs(eff.grid_e).max():.4g} once rounded"
+                        if quantized else ""), fontsize=9)
 
         # ---- impulse response --------------------------------------------
         ax = self.ax_imp
         ax.clear()
         n = np.arange(res.numtaps)
-        ax.stem(n, res.h, basefmt=" ", markerfmt="o", linefmt="-")
+        ax.stem(n, eff.h, basefmt=" ", markerfmt="o", linefmt="-")
         for line in ax.get_lines():
             line.set_markersize(3)
             line.set_linewidth(0.9)
+        if quantized:
+            ax.plot(n, res.h, ".", ms=2.5, color="#d62728", zorder=5,
+                    label="before rounding")
+            ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
         ax.set_xlim(-0.5, res.numtaps - 0.5)
         ax.set_xlabel("tap")
         ax.set_ylabel("h[n]")
@@ -780,10 +920,10 @@ class RemezApp:
     @staticmethod
     def _segment_slices(res):
         """Index slices of the grid, one per band, so bands are not joined up."""
-        f = res.grid_f
-        breaks = np.nonzero(np.diff(f) > 3 * np.median(np.diff(f)))[0]
+        band = res.grid_band
+        breaks = np.nonzero(np.diff(band))[0]
         starts = np.r_[0, breaks + 1]
-        stops = np.r_[breaks + 1, f.size]
+        stops = np.r_[breaks + 1, band.size]
         return [slice(a, b) for a, b in zip(starts, stops)]
 
     @staticmethod
@@ -878,9 +1018,13 @@ class RemezApp:
     # ------------------------------------------------------------- IIR drawing
 
     def redraw_iir(self):
-        res = self.iir_result
-        if res is None:
+        ideal = self.iir_result
+        if ideal is None:
             return
+        # Everything below is the filter as it will actually be built; the
+        # design it came from is drawn behind it when the two differ.
+        res = self.eff if self.eff is not None else ideal
+        quantized = self.fixed is not None
         nyq = res.fs / 2.0
         f = np.linspace(0.0, nyq, 4096)
         h = res.response_at(f)
@@ -890,8 +1034,13 @@ class RemezApp:
         # ---- magnitude -----------------------------------------------------
         ax = self.ax_imag
         ax.clear()
-        ax.plot(f, db(mag) if log else mag, lw=1.2, color="#1f77b4",
-                label="designed response", zorder=3)
+        if quantized:
+            im = np.abs(ideal.response_at(f))
+            ax.plot(f, db(im) if log else im, lw=0.9, color="0.6", zorder=2,
+                    label="ideal (double)")
+        ax.plot(f, db(mag) if log else mag, lw=1.2, color="#1f77b4", zorder=3,
+                label=f"{self.fixed.bits}-bit coefficients" if quantized
+                else "designed response")
         if self.show_spec.get():
             self._draw_iir_mask(ax, res, log)
         ax.set_xlim(0, nyq)
@@ -907,15 +1056,18 @@ class RemezApp:
         ax.set_title(
             f"{_APPROX_NAMES[res.approximation]} {res.response}, order {res.order}"
             f"   —   {len(res.sos)} biquad{'s' if len(res.sos) != 1 else ''}"
-            f"{'' if res.stable else '   *** UNSTABLE ***'}")
+            + (f"   —   {self.fixed.qformat} coefficients" if quantized else "")
+            + ("" if res.stable else "   *** UNSTABLE ***"))
 
         # ---- passband detail ------------------------------------------------
         ax = self.ax_idetail
         ax.clear()
+        seen = []
         for a, b in res.passband_ranges:
             bf = np.linspace(a, b, 800)
-            ax.plot(bf, db(np.abs(res.response_at(bf))), lw=1.2, color="#1f77b4",
-                    zorder=3)
+            m = db(np.abs(res.response_at(bf)))
+            ax.plot(bf, m, lw=1.2, color="#1f77b4", zorder=3)
+            seen.append(m[np.isfinite(m)])
         ax.axhline(0.0, color="#ff7f0e", lw=1.2, ls="--", zorder=2)
         ax.axhline(-res.rp, color="#ff7f0e", lw=1.2, ls="--", zorder=2,
                    label=f"−{res.rp:g} dB")
@@ -925,7 +1077,16 @@ class RemezApp:
         hi = max(b for _, b in res.passband_ranges)
         pad = 0.02 * (hi - lo)
         ax.set_xlim(max(0.0, lo - pad), min(nyq, hi + pad))
-        ax.set_ylim(-1.8 * res.rp, 0.8 * res.rp)
+        # The corridor the specification draws is the natural frame, but
+        # rounding the coefficients shifts the gain as well as widening the
+        # ripple, and a curve that has left the corridor still has to be shown.
+        ylo, yhi = -1.8 * res.rp, 0.8 * res.rp
+        seen = np.concatenate(seen) if any(s.size for s in seen) else np.array([])
+        if seen.size:
+            room = 0.2 * max(float(seen.max() - seen.min()), res.rp)
+            ylo = min(ylo, float(seen.min()) - room)
+            yhi = max(yhi, float(seen.max()) + room)
+        ax.set_ylim(ylo, yhi)
         ax.set_ylabel("passband (dB)")
         ax.grid(alpha=0.3)
         ax.legend(loc="lower left", fontsize=8, framealpha=0.9)
@@ -957,11 +1118,19 @@ class RemezApp:
         ax.plot(np.cos(t), np.sin(t), color="0.7", lw=0.9)
         ax.axhline(0, color="0.85", lw=0.7)
         ax.axvline(0, color="0.85", lw=0.7)
+        if quantized:
+            # Rounding the coefficients moves the roots; how close the poles
+            # come to the unit circle afterwards is what decides stability.
+            if len(ideal.z):
+                ax.plot(ideal.z.real, ideal.z.imag, "o", ms=6, mfc="none",
+                        mew=0.9, color="0.65", zorder=2)
+            ax.plot(ideal.p.real, ideal.p.imag, "x", ms=6, mew=0.9,
+                    color="0.65", zorder=2, label="before rounding")
         if len(res.z):
             ax.plot(res.z.real, res.z.imag, "o", ms=6, mfc="none", mew=1.2,
-                    color="#1f77b4", label="zeros")
+                    color="#1f77b4", label="zeros", zorder=3)
         ax.plot(res.p.real, res.p.imag, "x", ms=6, mew=1.4, color="#d62728",
-                label="poles")
+                label="poles", zorder=3)
         # A Butterworth's zeros all sit on top of each other at Nyquist, which
         # otherwise reads as a single zero.
         for roots, colour in ((res.z, "#1f77b4"), (res.p, "#d62728")):
@@ -977,7 +1146,9 @@ class RemezApp:
         ax.set_aspect("equal", adjustable="box")
         ax.grid(alpha=0.3)
         ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
-        ax.set_title(f"poles and zeros   —   max |p| = {res.max_pole_radius:.4f}",
+        ax.set_title("poles and zeros   —   max |p| = "
+                     f"{res.max_pole_radius:.4f}"
+                     + (f" (was {ideal.max_pole_radius:.4f})" if quantized else ""),
                      fontsize=9)
 
         # ---- impulse and step response ----------------------------------------
@@ -1057,9 +1228,10 @@ class RemezApp:
         self.report.configure(state="disabled")
 
     def _report_iir(self):
-        res = self.iir_result
+        ideal = self.iir_result
+        res = self.eff if self.eff is not None else ideal
         out = []
-        out.append(f"{_APPROX_NAMES[res.approximation]} {res.response}")
+        out.append(f"{_APPROX_NAMES[ideal.approximation]} {ideal.response}")
         out.append(f"order            {res.order}"
                    f"{'  (smallest that meets the spec)' if res.auto_order else ''}")
         out.append(f"digital degree   {res.degree}   "
@@ -1067,7 +1239,23 @@ class RemezApp:
                    f"{'s' if len(res.sos) != 1 else ''})")
         out.append(f"smallest order   {res.order_estimate}")
         out.append(f"max |pole|       {res.max_pole_radius:.6f}   "
-                   f"{'stable' if res.stable else '*** UNSTABLE ***'}")
+                   f"{'stable' if res.stable else '*** UNSTABLE ***'}"
+                   + (f"   (was {ideal.max_pole_radius:.6f})"
+                      if self.fixed is not None else ""))
+        out += self._arithmetic_lines()
+        if self.fixed is not None:
+            out.append(f"  passband ripple  {ideal.achieved_rp:.4g}"
+                       f" -> {res.achieved_rp:.4g} dB")
+            out.append(f"  stopband atten.  {ideal.achieved_rs:.4g}"
+                       f" -> {res.achieved_rs:.4g} dB")
+            shift = self._passband_gain_shift(ideal, res)
+            if np.isfinite(shift) and abs(shift) > 0.01:
+                out.append(f"  passband gain    {shift:+.3g} dB"
+                           "   (rescale a numerator to take it out)")
+            if ideal.stable and not res.stable:
+                out.append("  *** rounding pushed a pole outside the unit circle:")
+                out.append("      widen the coefficients, or split into more")
+                out.append("      sections so each pole pair is less sensitive ***")
         out.append("")
 
         out.append("spec check")
@@ -1094,10 +1282,20 @@ class RemezApp:
         out.append(f"sample rate      {res.fs:g}")
         out.append("")
 
-        out.append("second-order sections   b0 b1 b2 / a0 a1 a2")
-        for i, s in enumerate(res.sos):
-            out.append(f"  [{i}] b {s[0]: .12f} {s[1]: .12f} {s[2]: .12f}")
-            out.append(f"      a {s[3]: .12f} {s[4]: .12f} {s[5]: .12f}")
+        if self.fixed is not None:
+            q = self.fixed
+            out.append(f"second-order sections   b0 b1 b2 / a0 a1 a2"
+                       f"   as integer × 2^-{q.frac_bits}")
+            for i, (s, n) in enumerate(zip(res.sos, q.ints)):
+                out.append(f"  [{i}] b {s[0]: .9f} {s[1]: .9f} {s[2]: .9f}")
+                out.append(f"        {n[0]:>12d} {n[1]:>12d} {n[2]:>12d}")
+                out.append(f"      a {s[3]: .9f} {s[4]: .9f} {s[5]: .9f}")
+                out.append(f"        {'—':>12} {n[4]:>12d} {n[5]:>12d}")
+        else:
+            out.append("second-order sections   b0 b1 b2 / a0 a1 a2")
+            for i, s in enumerate(res.sos):
+                out.append(f"  [{i}] b {s[0]: .12f} {s[1]: .12f} {s[2]: .12f}")
+                out.append(f"      a {s[3]: .12f} {s[4]: .12f} {s[5]: .12f}")
         out.append("")
 
         out.append("poles (radius, frequency)")
@@ -1117,15 +1315,19 @@ class RemezApp:
 
     def _report_fir(self):
         res = self.result
+        eff = self.eff if self.eff is not None else res
         out = []
         out.append(f"type {res.ftype}  ({res.symmetry}, "
                    f"{'odd' if res.numtaps % 2 else 'even'} length {res.numtaps})")
         out.append(f"iterations       {res.iterations}"
                    f"{'' if res.converged else '   *** did not converge ***'}")
         out.append(f"weighted delta   {abs(res.delta):.6g}")
+        out += self._arithmetic_lines()
         out.append("")
+        if self.fixed is not None:
+            out.append("as built, after rounding the taps:")
         out.append("band          range            deviation      dB")
-        for i, (b, dev) in enumerate(zip(res.bands, res.band_deviation)):
+        for i, (b, dev) in enumerate(zip(res.bands, eff.band_deviation)):
             target = max(abs(b.d1), abs(b.d2))
             if target < 1e-12:
                 label = f"{db(dev):8.2f} atten"
@@ -1134,17 +1336,34 @@ class RemezApp:
             out.append(f"  {i + 1:<3d} {b.f1:8.4g}–{b.f2:<8.4g} "
                        f"{dev:12.4g}  {label}")
 
+        if self.fixed is not None:
+            out.append("")
+            out.append("cost of rounding, per band")
+            for i, (ideal_dev, dev) in enumerate(zip(res.band_deviation,
+                                                     eff.band_deviation)):
+                grew = dev / ideal_dev if ideal_dev > 0 else float("inf")
+                out.append(f"  band {i + 1}: {ideal_dev:.4g} -> {dev:.4g}"
+                           f"   ({db(grew):+.2f} dB)")
+
         if self.spec_dev is not None:
             out.append("")
             out.append("spec check")
-            for i, (dev, want) in enumerate(zip(res.band_deviation, self.spec_dev)):
+            for i, (dev, want) in enumerate(zip(eff.band_deviation, self.spec_dev)):
                 verdict = "met" if dev <= want * 1.0001 else "MISSED"
                 out.append(f"  band {i + 1}: achieved {dev:.4g}  "
                            f"required {want:.4g}   {verdict}")
-            if any(dv > wt * 1.0001 for dv, wt in zip(res.band_deviation, self.spec_dev)):
-                need = self._suggest_taps(res)
-                if need:
-                    out.append(f"  try about {need} taps to meet every spec")
+            missed = [dv > wt * 1.0001
+                      for dv, wt in zip(eff.band_deviation, self.spec_dev)]
+            if any(missed):
+                if self.fixed is not None and not any(
+                        dv > wt * 1.0001 for dv, wt in zip(res.band_deviation,
+                                                           self.spec_dev)):
+                    out.append("  the design met the spec; the word length lost it,")
+                    out.append("  so widen the coefficients rather than adding taps")
+                else:
+                    need = self._suggest_taps(res)
+                    if need:
+                        out.append(f"  try about {need} taps to meet every spec")
 
         if res.peak_amplitude > 10 * max(1.0, max(abs(b.d1) for b in res.bands)):
             out.append("")
@@ -1153,11 +1372,53 @@ class RemezApp:
             out.append("use fewer taps.")
 
         out.append("")
-        out.append("coefficients")
-        for i, v in enumerate(res.h):
-            out.append(f"  h[{i:<4d}] = {v: .12f}")
+        if self.fixed is not None:
+            q = self.fixed
+            out.append(f"coefficients      integer × 2^-{q.frac_bits}")
+            width = len(str(max(abs(int(v)) for v in q.ints))) + 1
+            for i, (v, n) in enumerate(zip(eff.h, q.ints)):
+                out.append(f"  h[{i:<4d}] = {v: .12f}   {n:>{width}d}")
+        else:
+            out.append("coefficients")
+            for i, v in enumerate(res.h):
+                out.append(f"  h[{i:<4d}] = {v: .12f}")
 
         self._write_report(out)
+
+    @staticmethod
+    def _passband_gain_shift(ideal, eff):
+        """How far rounding moved the passband gain, in dB.
+
+        Ripple is measured peak-to-peak and so says nothing about this: a
+        cascade whose numerators all rounded slightly high keeps its shape and
+        simply sits at the wrong level.
+        """
+        f = ii._region_grid(ideal.passband_ranges, ideal.fs, 512)
+        if f.size == 0:
+            return float("nan")
+        a = np.abs(ideal.response_at(f)).max()
+        b = np.abs(eff.response_at(f)).max()
+        if not (a > 0 and np.isfinite(b) and b > 0):
+            return float("nan")
+        return 20.0 * np.log10(b / a)
+
+    def _arithmetic_lines(self):
+        """The word length block shared by both reports."""
+        if self.fixed is None:
+            return []
+        q = self.fixed
+        lo, hi = q.limits
+        out = ["",
+               f"arithmetic       {q.bits}-bit fixed point, {q.qformat}",
+               f"  resolution     {q.step:.6g}"
+               f"   range [{lo * q.step:g}, {hi * q.step:g}]",
+               f"  worst rounding {q.max_error:.4g}"]
+        if q.saturated:
+            out.append(f"  *** {q.saturated} coefficient"
+                       f"{'s' if q.saturated != 1 else ''} saturated: the binary "
+                       "point is too far left ***")
+        out.append("  (coefficients only; datapath rounding is not modelled)")
+        return out
 
     def _suggest_taps(self, res):
         """Kaiser's order estimate over the narrowest transition band."""
@@ -1176,7 +1437,10 @@ class RemezApp:
     # ------------------------------------------------------------------ export
 
     def save_coefficients(self):
-        res = self.iir_result if self.is_iir() else self.result
+        # Always the coefficients as built: in fixed point that means the
+        # rounded values, alongside the integers they are stored as.
+        res = self.eff if self.eff is not None else (
+            self.iir_result if self.is_iir() else self.result)
         if res is None:
             return
         path = filedialog.asksaveasfilename(
@@ -1185,8 +1449,8 @@ class RemezApp:
             filetypes=[("CSV", "*.csv"), ("C header", "*.h"), ("Text", "*.txt")])
         if not path:
             return
-        lines = (self._iir_export(res, path) if self.is_iir()
-                 else self._fir_export(res, path))
+        lines = (self._iir_export(res, path, self.fixed) if self.is_iir()
+                 else self._fir_export(res, path, self.fixed))
         try:
             with open(path, "w") as fh:
                 fh.write("\n".join(lines) + "\n")
@@ -1194,49 +1458,85 @@ class RemezApp:
             messagebox.showerror("Save failed", str(exc))
 
     @staticmethod
-    def _iir_export(res, path):
+    def _format_note(fixed):
+        """One line describing the word length, for an export header."""
+        if fixed is None:
+            return "double precision coefficients"
+        return (f"{fixed.bits}-bit fixed point, {fixed.qformat}: "
+                f"value = integer * 2^-{fixed.frac_bits}")
+
+    @staticmethod
+    def _iir_export(res, path, fixed=None):
         """Biquad sections, as CSV or as a C table ready to cascade."""
         head = (f"{_APPROX_NAMES[res.approximation]} {res.response}, "
                 f"order {res.order}, fs = {res.fs:g}, "
                 f"{res.rp:g} dB / {res.rs:g} dB")
+        note = RemezApp._format_note(fixed)
         if path.endswith(".h"):
             lines = [f"/* {head} */",
+                     f"/* {note} */",
                      f"/* cascade of {len(res.sos)} biquads, "
                      "each y = b0 x + b1 x' + b2 x'' - a1 y' - a2 y'' */",
-                     f"#define IIR_SECTIONS {len(res.sos)}",
-                     "static const double iir_sos[IIR_SECTIONS][6] = {"]
+                     f"#define IIR_SECTIONS {len(res.sos)}"]
+            if fixed is not None:
+                lines += [f"#define IIR_FRAC_BITS {fixed.frac_bits}",
+                          "static const long iir_sos_q[IIR_SECTIONS][6] = {"]
+                lines += ["    {" + ", ".join(f"{int(v):d}" for v in s) + "},"
+                          for s in fixed.ints]
+                lines += ["};", ""]
+            lines += ["static const double iir_sos[IIR_SECTIONS][6] = {"]
             lines += ["    {" + ", ".join(f"{v: .17g}" for v in s) + "},"
                       for s in res.sos]
             lines += ["};", ""]
             return lines
         lines = [f"# {head}",
+                 f"# {note}",
                  f"# max |pole| = {res.max_pole_radius:.10g}, "
                  f"achieved {res.achieved_rp:.4g} dB / {res.achieved_rs:.4g} dB",
-                 "section,b0,b1,b2,a0,a1,a2"]
-        lines += [str(i) + "," + ",".join(f"{v:.17g}" for v in s)
-                  for i, s in enumerate(res.sos)]
+                 "section,b0,b1,b2,a0,a1,a2"
+                 + (",b0_q,b1_q,b2_q,a0_q,a1_q,a2_q" if fixed is not None else "")]
+        for i, s in enumerate(res.sos):
+            row = str(i) + "," + ",".join(f"{v:.17g}" for v in s)
+            if fixed is not None:
+                row += "," + ",".join(f"{int(v):d}" for v in fixed.ints[i])
+            lines.append(row)
         return lines
 
     @staticmethod
-    def _fir_export(res, path):
+    def _fir_export(res, path, fixed=None):
         """The impulse response, as CSV or as a C array."""
+        note = RemezApp._format_note(fixed)
         if path.endswith(".h"):
             lines = [f"/* Parks-McClellan FIR, type {res.ftype}, "
                      f"N = {res.numtaps}, delta = {abs(res.delta):.6g} */",
-                     f"#define FIR_TAPS {res.numtaps}",
-                     "static const double fir_coeffs[FIR_TAPS] = {"]
+                     f"/* {note} */",
+                     f"#define FIR_TAPS {res.numtaps}"]
+            if fixed is not None:
+                lines += [f"#define FIR_FRAC_BITS {fixed.frac_bits}",
+                          "static const long fir_coeffs_q[FIR_TAPS] = {"]
+                lines += [f"    {int(v):d}," for v in fixed.ints]
+                lines += ["};", ""]
+            lines += ["static const double fir_coeffs[FIR_TAPS] = {"]
             lines += [f"    {v: .17g}," for v in res.h]
             lines += ["};", ""]
             return lines
         lines = [f"# Parks-McClellan FIR, type {res.ftype}, "
                  f"N = {res.numtaps}, fs = {res.fs:g}",
+                 f"# {note}",
                  f"# weighted delta = {abs(res.delta):.10g}",
-                 "n,h"]
-        lines += [f"{i},{v:.17g}" for i, v in enumerate(res.h)]
+                 "n,h" + (",h_q" if fixed is not None else "")]
+        for i, v in enumerate(res.h):
+            row = f"{i},{v:.17g}"
+            if fixed is not None:
+                row += f",{int(fixed.ints[i]):d}"
+            lines.append(row)
         return lines
 
     def save_c_source(self):
-        res = self.iir_result if self.is_iir() else self.result
+        # The generated filter runs in double precision, but it must run the
+        # coefficients that were actually chosen, rounded ones included.
+        res = self.eff if self.eff is not None else (
+            self.iir_result if self.is_iir() else self.result)
         if res is None:
             return
         path = filedialog.asksaveasfilename(
@@ -1245,8 +1545,8 @@ class RemezApp:
             filetypes=[("C source", "*.c"), ("All files", "*")])
         if not path:
             return
-        source = (self._iir_c_source(res) if self.is_iir()
-                  else self._fir_c_source(res))
+        source = (self._iir_c_source(res, self.fixed) if self.is_iir()
+                  else self._fir_c_source(res, self.fixed))
         try:
             with open(path, "w") as fh:
                 fh.write(source)
@@ -1303,7 +1603,7 @@ class RemezApp:
         ])
 
     @staticmethod
-    def _iir_c_source(res):
+    def _iir_c_source(res, fixed=None):
         """A self-contained C implementation of the biquad cascade.
 
         The inner loop is the same transposed direct form II that
@@ -1326,7 +1626,8 @@ class RemezApp:
              f"{', '.join(f'{v:g}' for v in res.ws)}",
              f"{res.rp:g} dB passband ripple, {res.rs:g} dB stopband attenuation "
              f"(achieved {res.achieved_rp:.4g} dB / {res.achieved_rs:.4g} dB)",
-             f"max |pole| = {res.max_pole_radius:.10g}"],
+             f"max |pole| = {res.max_pole_radius:.10g}",
+             RemezApp._format_note(fixed)],
             f"Cascade of {len(res.sos)} biquads, each transposed direct form II.",
         ) + "\n".join([
             f"#define FILTER_SECTIONS {len(res.sos)}",
@@ -1379,7 +1680,7 @@ class RemezApp:
         ]) + "\n" + RemezApp._c_main()
 
     @staticmethod
-    def _fir_c_source(res):
+    def _fir_c_source(res, fixed=None):
         """A self-contained C implementation of the tapped delay line.
 
         The delay line is a circular buffer, so nothing is copied per sample;
@@ -1393,7 +1694,8 @@ class RemezApp:
             f"Parks-McClellan FIR filter, type {res.ftype} ({res.symmetry}), "
             f"N = {res.numtaps}",
             [f"sample rate {res.fs:g}, bands {band}",
-             f"weighted delta = {abs(res.delta):.10g}"],
+             f"weighted delta = {abs(res.delta):.10g}",
+             RemezApp._format_note(fixed)],
             "Direct form: a tapped delay line into one accumulator.",
         ) + "\n".join([
             f"#define FILTER_TAPS {res.numtaps}",

@@ -27,7 +27,7 @@ Nothing here depends on scipy; only numpy is required.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -36,6 +36,7 @@ __all__ = [
     "RemezResult",
     "RemezError",
     "design",
+    "with_taps",
     "amplitude_response",
     "kaiser_order_estimate",
 ]
@@ -87,6 +88,7 @@ class RemezResult:
     grid_w: np.ndarray             # weight on the grid
     grid_a: np.ndarray             # achieved amplitude on the grid
     grid_e: np.ndarray             # weighted error W*(D - A) on the grid
+    grid_band: np.ndarray          # index of the band each grid point lies in
     extremal_f: np.ndarray         # extremal frequencies, physical units
     extremal_e: np.ndarray         # weighted error at the extrema
     iterations: int
@@ -686,6 +688,7 @@ def design(numtaps: int,
         grid_w=w_wt,
         grid_a=amp,
         grid_e=err,
+        grid_band=seg,
         extremal_f=f[ext] * fs,
         extremal_e=err[ext],
         iterations=it,
@@ -694,6 +697,49 @@ def design(numtaps: int,
         peak_amplitude=peak_amp,
         fs=fs,
         bands=bands,
+    )
+
+
+def with_taps(res: RemezResult, h) -> RemezResult:
+    """Re-analyse a design as if it had been built with the taps ``h``.
+
+    Everything measured -- the amplitude over the grid, the weighted error, the
+    per-band deviations, the peak amplitude -- is recomputed for the given
+    taps, which is how a quantized version of a design gets plotted and
+    reported through the same path as the design itself.  The fields that
+    describe the *design* rather than the filter (delta, the extremal
+    frequencies, the iteration count) are carried over untouched: they say what
+    the exchange achieved, and rounding the taps afterwards does not change
+    that history.
+    """
+    h = np.asarray(h, dtype=float)
+    if h.shape != res.h.shape:
+        raise RemezError(f"expected {res.h.size} taps, got {h.size}")
+
+    w = 2.0 * np.pi * res.grid_f / res.fs
+    amp = amplitude_response(h, w, res.symmetry)
+    err = res.grid_w * (res.grid_d - amp)
+
+    dev = []
+    for idx in range(len(res.bands)):
+        m = res.grid_band == idx
+        dev.append(float(np.abs(res.grid_d[m] - amp[m]).max()) if m.any() else 0.0)
+
+    w_full = np.linspace(0.0, np.pi, max(8 * res.numtaps, 512))
+    peak_amp = float(np.abs(amplitude_response(h, w_full, res.symmetry)).max())
+
+    ext_w = 2.0 * np.pi * res.extremal_f / res.fs
+    ext_i = np.searchsorted(res.grid_f, res.extremal_f).clip(0, res.grid_f.size - 1)
+
+    return replace(
+        res,
+        h=h,
+        grid_a=amp,
+        grid_e=err,
+        extremal_e=res.grid_w[ext_i] * (
+            res.grid_d[ext_i] - amplitude_response(h, ext_w, res.symmetry)),
+        band_deviation=dev,
+        peak_amplitude=peak_amp,
     )
 
 

@@ -38,7 +38,7 @@ Nothing here depends on scipy; only numpy is required.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -48,6 +48,8 @@ __all__ = [
     "RESPONSES",
     "APPROXIMATIONS",
     "design",
+    "with_sos",
+    "sos_to_zpk",
     "estimate_order",
     "butter_ap",
     "cheb1_ap",
@@ -457,11 +459,18 @@ def zpk_to_sos(z, p, k):
 
 
 def sos_freqz(sos, w):
-    """Frequency response of a cascade at the digital frequencies ``w`` (rad/sample)."""
+    """Frequency response of a cascade at the digital frequencies ``w`` (rad/sample).
+
+    A pole sitting exactly on the unit circle -- which quantizing the
+    coefficients of a sharp filter can produce -- makes the denominator vanish
+    at that frequency.  The gain there really is infinite, so the division is
+    allowed to say so rather than warn about it.
+    """
     zi = np.exp(-1j * np.asarray(w, dtype=float))
     h = np.ones_like(zi)
-    for b0, b1, b2, a0, a1, a2 in np.atleast_2d(sos):
-        h = h * (b0 + b1 * zi + b2 * zi * zi) / (a0 + a1 * zi + a2 * zi * zi)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for b0, b1, b2, a0, a1, a2 in np.atleast_2d(sos):
+            h = h * (b0 + b1 * zi + b2 * zi * zi) / (a0 + a1 * zi + a2 * zi * zi)
     return h
 
 
@@ -730,6 +739,49 @@ def design(response: str,
         achieved_rp=achieved_rp, achieved_rs=achieved_rs,
         max_pole_radius=radius, stable=radius < 1.0,
         passband_ranges=pass_ranges, stopband_ranges=stop_ranges,
+    )
+
+
+def sos_to_zpk(sos):
+    """Zeros, poles and overall gain of a biquad cascade.
+
+    Roots at the origin are dropped: a section with b2 = 0 is a first-order
+    numerator padded out to two coefficients, and the z = 0 root that padding
+    creates is an artefact of the storage rather than a zero of the filter.
+    """
+    sos = np.asarray(sos, dtype=float)
+    z, p, k = [], [], 1.0
+    for b0, b1, b2, a0, a1, a2 in sos:
+        k *= b0 / a0
+        for coeffs, out in (((b0, b1, b2), z), ((a0, a1, a2), p)):
+            if coeffs[0] == 0.0:
+                continue
+            roots = np.roots(np.asarray(coeffs, dtype=float))
+            out.extend(r for r in roots if abs(r) > 1e-14)
+    return np.asarray(z), np.asarray(p), float(k)
+
+
+def with_sos(res: IIRResult, sos, npoints: int = 4096) -> IIRResult:
+    """Re-analyse a design as if it had been built from the sections ``sos``.
+
+    The poles and zeros, the stability margin and the achieved ripple and
+    attenuation are all re-derived from the given sections, so a quantized
+    version of a design can be plotted and reported through the same path as
+    the design itself.  The requested specification is carried over unchanged,
+    which is the point: it is what the quantized filter is then judged against.
+    """
+    sos = np.asarray(sos, dtype=float)
+    if sos.shape != res.sos.shape:
+        raise IIRError(f"expected sections shaped {res.sos.shape}, got {sos.shape}")
+    z, p, k = sos_to_zpk(sos)
+    radius = float(np.max(np.abs(p))) if len(p) else 0.0
+    return replace(
+        res,
+        z=z, p=p, k=k, sos=sos,
+        achieved_rp=_band_ripple(sos, res.passband_ranges, res.fs, npoints),
+        achieved_rs=_band_attenuation(sos, res.stopband_ranges, res.fs, npoints),
+        max_pole_radius=radius,
+        stable=radius < 1.0,
     )
 
 
