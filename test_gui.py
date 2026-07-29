@@ -781,3 +781,145 @@ def test_no_gain_shift_is_claimed_in_floating_point(iir):
     assert gui.RemezApp._passband_gain_shift(iir.iir_result,
                                              iir.iir_result) == pytest.approx(0.0)
     assert "passband gain" not in report_text(iir)
+
+
+# --------------------------------------------------- SystemVerilog generation
+
+
+def generate_sv(app, path, monkeypatch):
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                        lambda **kw: str(path))
+    app.save_sv_source()
+    return path.read_text() if path.exists() else ""
+
+
+def test_the_generate_sv_button_is_on_the_action_row(app):
+    labels = []
+    for child in app.root.winfo_children():
+        for frame in child.winfo_children():
+            for w in frame.winfo_children():
+                for b in w.winfo_children():
+                    if b.winfo_class() == "TButton":
+                        labels.append(b.cget("text"))
+    assert any("Generate SV" in str(t) for t in labels), labels
+
+
+def test_headroom_and_fixed_coefficients_default_sensibly(app):
+    assert app.headroom.get() == 2
+    assert app.fixed_coeffs.get() is True
+    assert str(app.headroom_spin["state"]) == "disabled"      # float mode
+    go_fixed(app, 12)
+    assert str(app.headroom_spin["state"]) == "normal"
+
+
+def test_the_status_line_reports_the_rtl_datapath(app):
+    go_fixed(app, 12)
+    app.headroom.set(5)
+    app._arith_changed()
+    text = app.arith_status.get()
+    assert "RTL datapath 17 bits" in text
+    assert "built in" in text
+    app.fixed_coeffs.set(False)
+    app._arith_changed()
+    assert "on a port" in app.arith_status.get()
+
+
+def test_generating_in_floating_point_is_refused_with_a_dialog(app, monkeypatch,
+                                                              tmp_path):
+    shown = []
+    monkeypatch.setattr(gui.messagebox, "showerror",
+                        lambda title, msg: shown.append((title, msg)))
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                        lambda **kw: str(tmp_path / "no.sv"))
+    app.save_sv_source()
+    assert shown and "Fixed point" in shown[0][1]
+    assert not (tmp_path / "no.sv").exists()
+
+
+def test_the_generated_fir_names_its_modules_after_the_file(app, tmp_path,
+                                                            monkeypatch):
+    go_fixed(app, 12)
+    src = generate_sv(app, tmp_path / "my_lowpass.sv", monkeypatch)
+    assert "module my_lowpass #(" in src
+    assert "module my_lowpass_mul" in src
+    assert f"parameter int NTAPS    = {app.result.numtaps}," in src
+    assert f"parameter int WCOEF    = {app.fixed.bits}," in src
+    assert f"parameter int FRAC     = {app.fixed.frac_bits}," in src
+    assert f"parameter int HEADROOM = {app.headroom.get()}," in src
+
+
+def test_the_headroom_setting_reaches_the_rtl(app, tmp_path, monkeypatch):
+    go_fixed(app, 10)
+    app.headroom.set(6)
+    app._arith_changed()
+    src = generate_sv(app, tmp_path / "h6.sv", monkeypatch)
+    assert "parameter int HEADROOM = 6," in src
+    assert "Datapath      16 bits = 10 + 6 headroom" in src
+
+
+def test_the_checkbox_switches_the_coefficient_port(app, tmp_path, monkeypatch):
+    go_fixed(app, 12)
+    built_in = generate_sv(app, tmp_path / "a.sv", monkeypatch)
+    assert "coeff," not in built_in
+    assert ".FIXED(1'b1)" in built_in
+
+    app.fixed_coeffs.set(False)
+    app._arith_changed()
+    ported = generate_sv(app, tmp_path / "b.sv", monkeypatch)
+    assert "input  wire signed [NTAPS*WCOEF-1:0] coeff," in ported
+    assert ".FIXED(1'b0)" in ported
+
+
+def test_the_generated_iir_is_a_biquad_cascade(iir, tmp_path, monkeypatch):
+    go_fixed(iir, 16)
+    src = generate_sv(iir, tmp_path / "ell.sv", monkeypatch)
+    assert f"parameter int NSEC     = {len(iir.eff.sos)}," in src
+    assert "u_mul_pa1" in src and ".NEG(1'b1)" in src
+    assert "u_z1" in src and "u_z2" in src
+    # the sections that went in are the quantized ones, not the design's
+    for value in iir.fixed.ints[0][[0, 1, 2, 4, 5]]:
+        assert str(int(value)) in src
+
+
+def test_a_saturating_word_length_is_refused_with_a_dialog(app, tmp_path,
+                                                           monkeypatch):
+    shown = []
+    monkeypatch.setattr(gui.messagebox, "showerror",
+                        lambda title, msg: shown.append((title, msg)))
+    go_fixed(app, 8, frac=12)                    # forces coefficient clipping
+    assert app.fixed.saturated
+    generate_sv(app, tmp_path / "bad.sv", monkeypatch)
+    assert shown and "saturated" in shown[0][1]
+
+
+@pytest.mark.skipif(shutil.which("verilator") is None,
+                    reason="verilator is not installed")
+def test_the_generated_rtl_lints_and_runs_the_designed_filter(app, tmp_path,
+                                                              monkeypatch):
+    """End to end: design, quantize, generate, simulate, compare."""
+    import sv_export as sv
+
+    app.numtaps.set(15)
+    app.design()
+    go_fixed(app, 12)
+    app.headroom.set(3)
+    app._arith_changed()
+    src = generate_sv(app, tmp_path / "dut.sv", monkeypatch)
+
+    lint = subprocess.run([shutil.which("verilator"), "--lint-only", "-Wall",
+                           str(tmp_path / "dut.sv")],
+                          capture_output=True, text=True)
+    assert lint.returncode == 0, lint.stdout + lint.stderr
+
+    import test_sv
+    stim = [4096, -4096, 2048, 0, 1024, -3000, 3000, 100, -100]
+    got = test_sv.run_rtl(tmp_path, src, "dut", stim, app.fixed.bits, 3)
+    want = sv.simulate("fir", app.fixed.ints, stim, app.fixed.frac_bits,
+                       app.fixed.bits, 3)
+    assert got == want
+
+    # And the integers really are the filter: an impulse returns the taps.
+    frac = app.fixed.frac_bits
+    impulse = [1 << frac] + [0] * app.result.numtaps
+    taps = test_sv.run_rtl(tmp_path, src, "dut", impulse, app.fixed.bits, 3)
+    assert taps[:app.result.numtaps] == [int(v) for v in app.fixed.ints]

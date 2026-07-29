@@ -17,6 +17,7 @@ Run with:  python remez_gui.py
 
 from __future__ import annotations
 
+import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -27,6 +28,7 @@ from matplotlib.figure import Figure
 import fir_core as rz
 import fixed_point as fp
 import iir_core as ii
+import sv_export as sv
 
 MODE_FIR = "FIR — Remez exchange"
 MODE_IIR = "IIR — bilinear transform"
@@ -175,6 +177,8 @@ class RemezApp:
         self.word_bits = tk.IntVar(value=16)
         self.auto_frac = tk.BooleanVar(value=True)
         self.frac_bits = tk.IntVar(value=15)
+        self.headroom = tk.IntVar(value=2)
+        self.fixed_coeffs = tk.BooleanVar(value=True)
         self.fixed = None
         self.eff = None
 
@@ -279,9 +283,25 @@ class RemezApp:
         self.fixed_widgets.append(f)
         self.frac_spin = f
 
+        # Headroom widens the datapath above the coefficient format, which is
+        # what keeps a chain of saturating adds off its limits.  It changes the
+        # hardware, not the coefficients, so it does not requantize anything.
+        ttk.Label(box, text="headroom").grid(row=4, column=1, sticky="e", padx=(8, 2))
+        hr = ttk.Spinbox(box, from_=0, to=32, width=4, textvariable=self.headroom,
+                         command=self._arith_changed)
+        hr.grid(row=4, column=2, sticky="w")
+        ttk.Label(box, text="bits").grid(row=4, column=3, sticky="w", padx=(2, 0))
+        self.fixed_widgets.append(hr)
+        self.headroom_spin = hr
+
+        c = ttk.Checkbutton(box, text="fixed coefficients (built into the RTL)",
+                            variable=self.fixed_coeffs, command=self._arith_changed)
+        c.grid(row=5, column=0, columnspan=5, sticky="w", pady=(2, 0))
+        self.fixed_widgets.append(c)
+
         self.arith_status = tk.StringVar(value="")
         ttk.Label(box, textvariable=self.arith_status, foreground="#555",
-                  justify="left").grid(row=4, column=0, columnspan=5, sticky="w",
+                  justify="left").grid(row=6, column=0, columnspan=5, sticky="w",
                                        pady=(4, 0))
         self._sync_arith_widgets()
 
@@ -294,14 +314,21 @@ class RemezApp:
             self.frac_spin.configure(state="disabled")
 
     def _build_actions(self, parent):
+        # Two rows: one wide row of five buttons would set the width of the
+        # whole control column, and the plot would pay for it.
         act = ttk.Frame(parent)
         act.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(act, text="Design  (Ctrl+Enter)", command=self.design).pack(side="left")
-        ttk.Button(act, text="Save coefficients…",
-                   command=self.save_coefficients).pack(side="left", padx=4)
-        ttk.Button(act, text="Save C…", command=self.save_c_source).pack(side="left")
-        ttk.Button(act, text="Save plot…",
-                   command=self.save_plot).pack(side="left", padx=4)
+        for column in range(3):
+            act.columnconfigure(column, weight=1)
+        buttons = [("Design  (Ctrl+Enter)", self.design, 0, 0, 2),
+                   ("Save plot…", self.save_plot, 0, 2, 1),
+                   ("Save coefficients…", self.save_coefficients, 1, 0, 1),
+                   ("Save C…", self.save_c_source, 1, 1, 1),
+                   ("Generate SV…", self.save_sv_source, 1, 2, 1)]
+        for text, command, row, column, span in buttons:
+            ttk.Button(act, text=text, command=command).grid(
+                row=row, column=column, columnspan=span, sticky="ew",
+                padx=(0, 3), pady=(0, 3))
 
     def _build_display(self, parent):
         opt = ttk.LabelFrame(parent, text="Display", padding=6)
@@ -736,11 +763,18 @@ class RemezApp:
         if self.auto_frac.get():
             self.frac_bits.set(q.frac_bits)
         lo, hi = q.limits
+        try:
+            headroom = max(int(self.headroom.get()), 0)
+        except tk.TclError:
+            headroom = 0
         self.arith_status.set(
             f"{q.qformat}   step {q.step:.3g}   "
             f"range [{lo * q.step:g}, {hi * q.step:g}]\n"
-            f"largest coefficient error {q.max_error:.3g}"
-            + (f"   ***  {q.saturated} saturated  ***" if q.saturated else ""))
+            f"largest coefficient error {q.max_error:.3g}\n"
+            f"RTL datapath {q.bits + headroom} bits "
+            f"(Q{q.int_bits + headroom}.{q.frac_bits}), coefficients "
+            + ("built in" if self.fixed_coeffs.get() else "on a port")
+            + (f"\n***  {q.saturated} saturated  ***" if q.saturated else ""))
 
     def _arith_changed(self, *_):
         """An arithmetic control moved: requantize, but do not redesign."""
@@ -1531,6 +1565,43 @@ class RemezApp:
                 row += f",{int(fixed.ints[i]):d}"
             lines.append(row)
         return lines
+
+    def save_sv_source(self):
+        """Write the filter out as synthesisable SystemVerilog."""
+        res = self.eff if self.eff is not None else (
+            self.iir_result if self.is_iir() else self.result)
+        if res is None:
+            return
+        if self.fixed is None:
+            messagebox.showerror(
+                "Nothing to generate",
+                "RTL needs fixed-point coefficients.\n\n"
+                "Choose Fixed point in the Arithmetic panel, pick a word "
+                "length, and try again.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Generate SystemVerilog",
+            defaultextension=".sv",
+            filetypes=[("SystemVerilog", "*.sv"), ("Verilog", "*.v"),
+                       ("All files", "*")])
+        if not path:
+            return
+
+        stem = os.path.splitext(os.path.basename(path))[0]
+        try:
+            opts = sv.SvOptions(name=stem,
+                                headroom=int(self.headroom.get()),
+                                fixed_coeffs=bool(self.fixed_coeffs.get()))
+            source = sv.source_for("iir" if self.is_iir() else "fir",
+                                   res, self.fixed, opts)
+        except (sv.SvError, ValueError, tk.TclError) as exc:
+            messagebox.showerror("Cannot generate RTL", str(exc))
+            return
+        try:
+            with open(path, "w") as fh:
+                fh.write(source)
+        except OSError as exc:
+            messagebox.showerror("Save failed", str(exc))
 
     def save_c_source(self):
         # The generated filter runs in double precision, but it must run the

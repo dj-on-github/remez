@@ -126,6 +126,12 @@ untick the box to set it yourself. The panel reports the format, the resolution,
 the representable range and the largest rounding error, and says so loudly if
 anything had to be clipped to fit.
 
+Two more settings in the panel belong to the hardware rather than the
+coefficients, and are described under [Generate SV](#generate-sv):
+**headroom**, which widens the datapath above the coefficient format, and
+**fixed coefficients**, which decides whether the RTL builds the values in or
+takes them on a port.
+
 Rounding is not free, and the point of showing it is that the cost is specific
 and visible:
 
@@ -148,7 +154,8 @@ separate question and is not simulated.
 
 **Save C…** asks where to put it and writes a self-contained C file that
 implements the filter currently on screen — the biquad cascade in IIR mode, the
-tapped delay line in FIR mode. The interface is the same either way:
+tapped delay line in FIR mode.  For hardware rather than software, see
+[Generate SV](#generate-sv). The interface is the same either way:
 
 ```c
 typedef struct { ... } t_ctx;
@@ -174,6 +181,73 @@ program that filters whitespace-separated doubles from stdin to stdout:
 ```bash
 cc -std=c99 -O2 -DFILTER_MAIN -o myfilter myfilter.c && ./myfilter < in.txt > out.txt
 ```
+
+## Generate SV
+
+**Generate SV…** writes the structure the design view draws as synthesisable
+SystemVerilog. It needs fixed-point coefficients — there is nothing to build a
+multiplier from otherwise — and refuses, with a reason, if any coefficient
+saturated when it was quantized.
+
+One file comes out, holding four modules plus the filter. The names are taken
+from the filename you choose, so two generated filters can live in one project:
+
+| module | what it is |
+| --- | --- |
+| `<name>_mul` | one coefficient multiply: exact product, rounded to nearest, saturated back to the datapath width |
+| `<name>_add` | one datapath-width add, saturating |
+| `<name>_sat` | clamps a wide signed value into a narrow one, used by both |
+| `<name>_delay` | one unit delay, advancing only when `din_strb` is seen |
+| `<name>` | the filter, instantiating the above in the topology of the design |
+
+```systemverilog
+module <name> #(parameter int NTAPS, WCOEF, FRAC, HEADROOM, WDATA) (
+    input  wire                     clk,
+    input  wire                     resetn,     // synchronous, active low
+    input  wire signed [WDATA-1:0]  din,
+    input  wire                     din_strb,
+    output logic signed [WDATA-1:0] dout,
+    output logic                    dout_strb
+);
+```
+
+A strobe on `din_strb` with a sample on `din` advances the delay line and
+registers the result, which appears on `dout` with `dout_strb` high for one
+cycle — one clock of latency. Samples may arrive as slowly as you like; the
+delay elements only move when strobed.
+
+**Numbers.** Coefficients are `WCOEF` bits with `FRAC` fractional bits, exactly
+as the Arithmetic panel quantized them. The datapath carries the same `FRAC`
+fractional bits and `HEADROOM` extra integer bits, so everything — `din`,
+`dout` and every internal signal — is `WDATA = WCOEF + HEADROOM` bits, and
+unity is `1 << FRAC`. The **headroom** setting is what keeps the adder chain off
+its limits: a direct-form FIR sums N products, and with no integer bits above
+the coefficient format that sum clips. Adds saturate rather than wrap, because a
+filter that clips is bad and one that wraps is unrecognisable.
+
+**Coefficients.** With **fixed coefficients** ticked the values are
+elaboration-time parameters, so synthesis can specialise every multiplier —
+often into a few shifts and adds — and there is no coefficient port. Untick it
+and the top level gains a packed `coeff` input that can be changed while the
+filter runs, at the cost of real multipliers. The header comment lists which
+slice holds which coefficient. For an IIR the slots are `b0 b1 b2 a1 a2` per
+section, given exactly as designed: `a0` is 1 and nothing multiplies by it, and
+`a1`/`a2` are negated inside the multiplier so the recursion's subtractions
+need no separate subtractor.
+
+An IIR comes out as a cascade of biquads in transposed direct form II, the same
+arrangement the design view draws and the generated C runs.
+
+One caveat on the plots: they show the response of the quantized *coefficients*
+in exact arithmetic. The RTL additionally rounds every product and saturates
+every add, so its response is close to the plotted one but not identical.
+`sv_export.simulate` is a bit-exact model of the generated datapath if you want
+to see the difference for a given signal.
+
+The RTL lints clean under `verilator --lint-only -Wall`, and the tests compile
+it and run it against a bit-exact Python model of the same datapath, sample for
+sample, in both coefficient modes and for both filter kinds. An impulse pushed
+through the compiled hardware returns the quantized taps exactly.
 
 ## Design view
 
@@ -286,6 +360,11 @@ Two numerical details are worth knowing about, and each has a test:
 ```bash
 .venv/bin/python -m pytest -q
 ```
+
+`test_sv.py` checks the generated RTL: that it lints without a warning, that
+what Verilator computes matches the Python model of the datapath bit for bit,
+that runtime coefficients give the same answer as built-in ones, that an impulse
+returns the taps, and that headroom is what stops the adder chain clipping.
 
 `test_fixed_point.py` checks the quantization: that values land on the lattice,
 that the automatic binary point gives away no resolution, that linear phase
