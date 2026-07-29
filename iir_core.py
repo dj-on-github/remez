@@ -1,6 +1,6 @@
 """Classical IIR filter design: analog prototypes and the bilinear transform.
 
-This is the recursive counterpart to :mod:`remez_core`.  Where the Remez
+This is the recursive counterpart to :mod:`fir_core`.  Where the Remez
 exchange searches numerically for the best polynomial, the classical IIR
 designs are closed form: a normalised analog lowpass prototype with a known
 pole-zero pattern is transformed to the wanted band, then mapped to the unit

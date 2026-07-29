@@ -25,7 +25,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 import iir_core as ii
-import remez_core as rz
+import fir_core as rz
 
 MODE_FIR = "FIR — Remez exchange"
 MODE_IIR = "IIR — bilinear transform"

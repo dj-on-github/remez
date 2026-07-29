@@ -1,10 +1,10 @@
-"""Checks for remez_core: alternation, symmetry, and agreement with scipy."""
+"""Checks for fir_core: alternation, symmetry, and agreement with scipy."""
 
 import numpy as np
 import pytest
 from scipy import signal
 
-import remez_core as rz
+import fir_core as rz
 
 
 def amp(res, w):

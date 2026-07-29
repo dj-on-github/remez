@@ -27,7 +27,7 @@ python3 -m venv --system-site-packages .venv && .venv/bin/pip install -r require
 .venv/bin/python remez_gui.py
 ```
 
-Requires numpy and matplotlib; the algorithms themselves (`remez_core.py` and
+Requires numpy and matplotlib; the algorithms themselves (`fir_core.py` and
 `iir_core.py`) need only numpy. scipy is used by the tests to cross-check
 designs, not by the program.
 
@@ -170,7 +170,7 @@ need instead.
 
 ## The FIR algorithm
 
-`remez_core.py` implements the exchange directly rather than wrapping
+`fir_core.py` implements the exchange directly rather than wrapping
 `scipy.signal.remez`. All four linear-phase types are supported by writing the
 zero-phase amplitude as `A(w) = Q(w)·P(cos w)` and folding `Q` into the desired
 response and the weight, which reduces every case to the same type-I problem:
