@@ -6,6 +6,8 @@ design to the rendered figure.
 """
 
 import os
+import shutil
+import subprocess
 
 import numpy as np
 import pytest
@@ -439,6 +441,92 @@ def test_a_failed_design_does_not_break_the_design_view(iir):
     iir.design()
     assert iir.iir_result is not None
     assert any("biquad" in t for t in diagram_text(iir))
+
+
+# ------------------------------------------------------------- C source export
+
+
+def buttons(widget):
+    """Every button text under ``widget``, however deeply nested."""
+    out = []
+    for child in widget.winfo_children():
+        if isinstance(child, gui.ttk.Button):
+            out.append(child["text"])
+        out.extend(buttons(child))
+    return out
+
+
+def save_c(app, path, monkeypatch):
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    app.save_c_source()
+    return path.read_text()
+
+
+def build_and_run(tmp_path, source, samples):
+    """Compile the generated filter and push samples through it."""
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler available")
+    src = tmp_path / "filter.c"
+    exe = tmp_path / "filter"
+    src.write_text(source)
+    build = subprocess.run(
+        [cc, "-std=c99", "-Wall", "-Wextra", "-pedantic", "-O2",
+         "-DFILTER_MAIN", "-o", str(exe), str(src), "-lm"],
+        capture_output=True, text=True)
+    assert build.returncode == 0, build.stderr
+    assert build.stderr == "", build.stderr        # and without a single warning
+    run = subprocess.run([str(exe)], text=True, capture_output=True,
+                         input="\n".join(f"{v:.17g}" for v in samples))
+    assert run.returncode == 0, run.stderr
+    return np.array([float(v) for v in run.stdout.split()])
+
+
+def test_the_save_c_button_is_on_the_action_row(app):
+    assert "Save C…" in buttons(app.root)
+
+
+def test_save_c_declares_the_requested_interface(iir, tmp_path, monkeypatch):
+    text = save_c(iir, tmp_path / "iir.c", monkeypatch)
+    assert "typedef struct {" in text and "} t_ctx;" in text
+    assert "int init_filter(t_ctx *ctx)" in text
+    assert "double process_sample(double sample, t_ctx *ctx)" in text
+    assert "void free_filter(t_ctx *ctx)" in text
+    assert "calloc(" in text                       # it allocates its own state
+    assert f"#define FILTER_SECTIONS {len(iir.iir_result.sos)}" in text
+
+
+def test_save_c_in_fir_mode_writes_the_taps(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    assert f"#define FILTER_TAPS {app.result.numtaps}" in text
+    assert "double process_sample(double sample, t_ctx *ctx)" in text
+    assert f"{app.result.h[0]: .17g}," in text
+
+
+def test_save_c_does_nothing_if_the_dialog_is_cancelled(iir, tmp_path, monkeypatch):
+    target = tmp_path / "nothing.c"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: "")
+    iir.save_c_source()
+    assert not target.exists()
+
+
+def test_the_generated_iir_c_filters_exactly_as_the_designer_does(
+        iir, tmp_path, monkeypatch):
+    iir.load_iir_preset("Elliptic bandpass")
+    iir.design()
+    source = save_c(iir, tmp_path / "iir.c", monkeypatch)
+    x = np.random.default_rng(3).standard_normal(300)
+    got = build_and_run(tmp_path, source, x)
+    assert len(got) == len(x)
+    # the same transposed direct form II in the same order: bit for bit
+    assert np.array_equal(got, ii.sos_filter(iir.iir_result.sos, x))
+
+
+def test_the_generated_fir_c_filters_as_designed(app, tmp_path, monkeypatch):
+    source = save_c(app, tmp_path / "fir.c", monkeypatch)
+    x = np.random.default_rng(4).standard_normal(300)
+    got = build_and_run(tmp_path, source, x)
+    assert np.allclose(got, np.convolve(x, app.result.h)[:len(x)], atol=1e-12)
 
 
 def test_exports(app, tmp_path, monkeypatch):

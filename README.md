@@ -56,7 +56,8 @@ computed for you. The report then says whether each spec was actually met, and
 if not, roughly how many taps it would take (Kaiser's estimate).
 
 Press **Design**, Return or F5 after editing. Coefficients export as CSV or as a
-C header; the plot exports as PNG, PDF or SVG.
+C header, the plot exports as PNG, PDF or SVG, and **Save C…** writes a working
+implementation — see [Save C](#save-c) below.
 
 The four panels show:
 
@@ -105,6 +106,35 @@ Note that the bilinear transform is geometrically symmetric about the band
 centre while your edges generally are not, so for a bandpass or bandstop one of
 the two transitions comes out wider than requested. The report says whether
 each spec was actually met.
+
+## Save C
+
+**Save C…** asks where to put it and writes a self-contained C file that
+implements the filter currently on screen — the biquad cascade in IIR mode, the
+tapped delay line in FIR mode. The interface is the same either way:
+
+```c
+typedef struct { ... } t_ctx;
+
+int    init_filter(t_ctx *ctx);                     /* 0, or -1 out of memory */
+double process_sample(double sample, t_ctx *ctx);
+void   free_filter(t_ctx *ctx);
+```
+
+`init_filter` allocates the filter's own state — two delay elements per biquad,
+or one delay line of `N` samples — and zeroes it; `process_sample` takes one
+sample and returns one filtered sample; `free_filter` gives the state back. The
+coefficients are a `static const` table in the file, printed to seventeen
+significant figures, so nothing rounds on the way out.
+
+The generated IIR code runs the same transposed direct form II in the same
+section order as `iir_core.sos_filter`, and a test compiles it and checks it
+agrees bit for bit. Compile it with `-DFILTER_MAIN` and you get a stand-alone
+program that filters whitespace-separated doubles from stdin to stdout:
+
+```bash
+cc -std=c99 -O2 -DFILTER_MAIN -o myfilter myfilter.c && ./myfilter < in.txt > out.txt
+```
 
 ## Design view
 
@@ -229,4 +259,7 @@ meets the spec, and that the elliptic prototype really is equiripple in both
 bands. `test_gui.py` drives the real Tk widgets in both modes and both views,
 from the entry fields through to the rendered figure — including that the
 structure diagram has the right number of delays and adders for the filter it
-is drawing, and carries the actual coefficients.
+is drawing and carries the actual coefficients, and that the exported C
+compiles without a warning under `-Wall -Wextra -pedantic` and filters a random
+signal to the same numbers the designer does. The C tests skip themselves if
+there is no compiler on the machine.
