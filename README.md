@@ -1,11 +1,19 @@
-# Remez exchange FIR filter designer
+# Digital filter designer
 
-A from-scratch implementation of the Parks–McClellan / Remez exchange algorithm
-for optimal (equiripple) linear-phase FIR filters, with a Tk GUI: constraints and
-filter parameters on the left, the specification and the resulting filter curve
-plotted on the right.
+A from-scratch implementation of the two classical ways to design a digital
+filter, with a Tk GUI: constraints and filter parameters on the left, the
+specification and the resulting filter plotted on the right. The **Mode**
+pulldown at the top left chooses between them, and the **View** pulldown above
+the plots switches between the response curves and a diagram of the structure
+you would build.
 
-The plot panel, here on the multiband preset:
+- **FIR — Remez exchange.** The Parks–McClellan algorithm for optimal
+  (equiripple) linear-phase FIR filters, over arbitrarily many bands.
+- **IIR — bilinear transform.** Butterworth, Chebyshev I, Chebyshev II and
+  elliptic lowpass, highpass, bandpass and bandstop filters, designed from an
+  analog prototype and mapped to the unit disc.
+
+The plot panel, here on the multiband FIR preset:
 
 ![the plot panel on a four-band design](docs/example-plot.png)
 
@@ -19,10 +27,11 @@ python3 -m venv --system-site-packages .venv && .venv/bin/pip install -r require
 .venv/bin/python remez_gui.py
 ```
 
-Requires numpy and matplotlib; the algorithm itself (`remez_core.py`) needs only
-numpy. scipy is used by the tests to cross-check designs, not by the program.
+Requires numpy and matplotlib; the algorithms themselves (`remez_core.py` and
+`iir_core.py`) need only numpy. scipy is used by the tests to cross-check
+designs, not by the program.
 
-## Using the GUI
+## FIR mode
 
 **Filter** sets the length, the symmetry, and the sample rate. Band edges are
 entered in whatever units the sample rate is in — leave it at 1.0 for normalised
@@ -59,7 +68,77 @@ The four panels show:
    the alternating extrema — this is the algorithm's own view of the problem;
 4. the impulse response.
 
-## The algorithm
+## IIR mode
+
+**Filter** picks the response (lowpass, highpass, bandpass, bandstop) and the
+approximation (Butterworth, Chebyshev I, Chebyshev II, elliptic), and either
+takes an order or works out the smallest one that meets the specification.
+
+**Bands and specification** is the specification itself: the passband edge, the
+stopband edge, the peak-to-peak passband ripple in dB and the stopband
+attenuation in dB. A bandpass or bandstop takes two of each, ordered
+`fs1 < fp1 < fp2 < fs2` and `fp1 < fs1 < fs2 < fp2` respectively.
+
+The filter is placed so that the edge each approximation actually pins down
+falls exactly on the frequency asked for — the passband edge, except for
+Chebyshev II, which is defined by where its stopband begins. The other edge is
+what the order is worked out from. A Butterworth has no ripple to pin an edge
+to, so it is widened from its −3 dB normalisation until the response is exactly
+`rp` dB down at the passband edge; this is the same convention `scipy.signal`'s
+`buttord` uses, and it means the passband spec is met exactly whatever order
+you choose.
+
+| approximation | passband | stopband | order for 0.5 dB / 60 dB over 0.2 … 0.25 |
+| --- | --- | --- | --- |
+| Butterworth | maximally flat | maximally flat | 25 |
+| Chebyshev I | equiripple | monotonic | 11 |
+| Chebyshev II | monotonic | equiripple | 11 |
+| Elliptic | equiripple | equiripple | 7 |
+
+The five panels show the magnitude against the specification mask, the passband
+ripple zoomed onto the passband, the group delay with the unwrapped phase
+behind it, the pole-zero pattern (with `×n` marking coincident roots), and the
+impulse and step responses. Coefficients export as second-order sections, in
+CSV or as a C array ready to cascade.
+
+Note that the bilinear transform is geometrically symmetric about the band
+centre while your edges generally are not, so for a bandpass or bandstop one of
+the two transitions comes out wider than requested. The report says whether
+each spec was actually met.
+
+## Design view
+
+The **View** pulldown above the plots switches from the response curves to the
+data flow of the filter that is currently designed — the adders, unit delays
+and multipliers you would actually build, each multiplier labelled with the
+constant that goes into it. It redraws whenever the design does, and saves as
+PNG, PDF or SVG through the same **Save plot…** button.
+
+In IIR mode this is the biquad cascade: a strip along the top showing the
+running order, then every second-order section drawn as **transposed direct
+form II** — which is the structure `iir_core.sos_filter` runs and the one the
+exported coefficients are meant for:
+
+```
+y[n]  = b0·x[n] + s1[n−1]
+s1[n] = b1·x[n] − a1·y[n] + s2[n−1]
+s2[n] = b2·x[n] − a2·y[n]
+```
+
+Each section is titled with its pole radius and pole frequency, and the signal
+between sections is named `x[n] → w1[n] → w2[n] → … → y[n]` so the chaining is
+explicit. An odd-order filter has one first-order section, which arrives padded
+with zeros; those branches are drawn in grey rather than dropped, so the picture
+and the six exported numbers per section stay in step. The overall gain is
+folded into the first section's numerator, so there is no separate gain block.
+
+In FIR mode it is the direct form — one tapped delay line into one accumulator,
+with every tap labelled. Past thirteen taps the middle of the delay line is
+replaced by a break, and the caption names exactly which taps are missing from
+the picture; it also notes how many multipliers the symmetry-folded form would
+need instead.
+
+## The FIR algorithm
 
 `remez_core.py` implements the exchange directly rather than wrapping
 `scipy.signal.remez`. All four linear-phase types are supported by writing the
@@ -98,13 +177,56 @@ A few details matter for robustness, and each is exercised by a test:
   Fitting the sampled amplitude instead is ill-conditioned exactly when a wide
   unconstrained transition band lets the polynomial run away.
 
+## The IIR algorithm
+
+`iir_core.py` builds the analog prototype from its poles and zeros, applies the
+usual `lp2lp` / `lp2hp` / `lp2bp` / `lp2bs` substitutions, and maps the result
+onto the unit disc with the bilinear transform, pre-warping the band edges so
+they land back where they were asked for. Everything is carried in zero-pole-gain
+form and only turned into coefficients at the end, as second-order sections
+paired nearest-pole-to-nearest-zero and ordered with the sharpest section last.
+
+The elliptic case is the one with any depth to it. It is the minimax solution of
+the same approximation problem the Remez exchange solves, but over rational
+rather than polynomial functions, which is why it needs so many fewer poles than
+the alternatives — and unlike the exchange it is closed form, because Cauer
+already solved it. Given the two ripple figures, the discrimination factor
+`k1 = eps_p/eps_s` and the degree equation `n K'(k)/K(k) = K'(k1)/K(k1)` fix the
+selectivity `k`, and the poles and zeros then come straight out of the Jacobi
+elliptic functions `cd` and `sn`. Those are evaluated by the descending Landen
+transformation — reduce the modulus to nothing, where `sn` is just a sine, then
+undo the reductions one at a time — following Orfanidis, *Lecture Notes on
+Elliptic Filter Design*.
+
+Two numerical details are worth knowing about, and each has a test:
+
+- **The complete elliptic integral is parameterised by the complementary
+  modulus.** The order estimate needs `K(k)` and `K'(k)` for the same `k`, and
+  one of the two is always evaluated at a modulus that is 1 to double precision
+  if it is passed in directly. Taking `k'` as the argument and running the
+  arithmetic-geometric mean from there keeps both accurate.
+- **The degree equation has two solvers.** The Landen route above is exact until
+  `k1` gets small enough — a fraction of a dB of passband ripple against 100 dB
+  of stopband — that `sqrt(1 - k1²)` is 1 and every digit of `1 - sqrt(k')` is
+  round-off. Below `k1 = 1e-6` it switches to the theta series in the nome,
+  where the degree equation is simply `q = q1^(1/n)`, and forms the nome with
+  `log1p`/`expm1` so the cancellation never happens.
+
 ## Tests
 
 ```bash
 .venv/bin/python -m pytest -q
 ```
 
-`test_remez.py` checks the algorithm — agreement with `scipy.signal.remez` on a
+`test_remez.py` checks the exchange — agreement with `scipy.signal.remez` on a
 fine grid, the alternation and equiripple properties, tap symmetry, the four
-types, weighting, and input validation. `test_gui.py` drives the real Tk widgets
-from the entry fields through to the rendered figure.
+types, weighting, and input validation. `test_iir.py` checks the IIR designs
+against `scipy.signal`: the four analog prototypes over a range of orders and
+ripples, the frequency transformations and the bilinear map, the order estimates
+against `buttord`/`cheb1ord`/`cheb2ord`/`ellipord`, and the finished filters
+against `iirfilter` — plus that the automatic order is the smallest one that
+meets the spec, and that the elliptic prototype really is equiripple in both
+bands. `test_gui.py` drives the real Tk widgets in both modes and both views,
+from the entry fields through to the rendered figure — including that the
+structure diagram has the right number of delays and adders for the filter it
+is drawing, and carries the actual coefficients.

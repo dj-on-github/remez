@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Interactive Parks-McClellan (Remez exchange) FIR filter designer.
+"""Interactive digital filter designer: Remez-exchange FIR and classical IIR.
 
-Constraints and filter parameters are entered on the left; the right hand side
-plots the specification, the resulting amplitude response, the weighted error
-with its extremal frequencies, and the impulse response.
+The mode selector at the top left chooses between the two design methods.  In
+either mode the constraints and filter parameters are entered on the left and
+the right hand side plots what came out.
+
+FIR mode runs the Parks-McClellan exchange and plots the specification, the
+amplitude response, the weighted error with its extremal frequencies, and the
+impulse response.  IIR mode designs a Butterworth, Chebyshev or elliptic filter
+by the bilinear transform and plots the magnitude, the passband detail, the
+group delay and phase, the pole-zero pattern and the impulse and step
+responses.
 
 Run with:  python remez_gui.py
 """
@@ -17,7 +24,16 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
+import iir_core as ii
 import remez_core as rz
+
+MODE_FIR = "FIR — Remez exchange"
+MODE_IIR = "IIR — bilinear transform"
+MODES = [MODE_FIR, MODE_IIR]
+
+VIEW_PLOT = "Plot view"
+VIEW_DESIGN = "Design view"
+VIEWS = [VIEW_PLOT, VIEW_DESIGN]
 
 # --------------------------------------------------------------------------
 # Presets: (symmetry, taps, [(f1, f2, d1, d2, weight, spec_dB, inv_f)])
@@ -66,6 +82,34 @@ COLUMNS = ["F start", "F stop", "Desired\nat start", "Desired\nat stop",
            "Weight", "Spec\n(dB)", "1/f"]
 COL_WIDTH = [7, 7, 7, 7, 6, 6, 2]
 
+# --------------------------------------------------------------------------
+# IIR mode
+# --------------------------------------------------------------------------
+
+RESPONSE_LABELS = {"Lowpass": "lowpass", "Highpass": "highpass",
+                   "Bandpass": "bandpass", "Bandstop": "bandstop"}
+APPROX_LABELS = {"Butterworth": "butterworth", "Chebyshev I": "chebyshev1",
+                 "Chebyshev II": "chebyshev2", "Elliptic": "elliptic"}
+_RESPONSE_NAMES = {v: k for k, v in RESPONSE_LABELS.items()}
+_APPROX_NAMES = {v: k for k, v in APPROX_LABELS.items()}
+
+# (response, approximation, passband edges, stopband edges, rp dB, rs dB, order)
+# Frequencies are fractions of fs; an order of None means "smallest that meets
+# the specification".
+IIR_PRESETS = {
+    "Elliptic lowpass": ("lowpass", "elliptic", (0.20,), (0.25,), 0.5, 60.0, None),
+    "Elliptic highpass": ("highpass", "elliptic", (0.25,), (0.20,), 0.5, 60.0, None),
+    "Elliptic bandpass": ("bandpass", "elliptic", (0.18, 0.32), (0.12, 0.38),
+                          0.5, 60.0, None),
+    "Elliptic bandstop": ("bandstop", "elliptic", (0.14, 0.36), (0.20, 0.30),
+                          0.5, 60.0, None),
+    "Butterworth lowpass": ("lowpass", "butterworth", (0.20,), (0.32,), 1.0, 40.0, None),
+    "Chebyshev I lowpass": ("lowpass", "chebyshev1", (0.20,), (0.28,), 0.5, 50.0, None),
+    "Chebyshev II lowpass": ("lowpass", "chebyshev2", (0.20,), (0.28,), 0.5, 50.0, None),
+    "Narrow notch": ("bandstop", "elliptic", (0.16, 0.24), (0.19, 0.21), 0.2, 50.0, None),
+    "Steep anti-alias": ("lowpass", "elliptic", (0.22,), (0.25,), 0.1, 90.0, None),
+}
+
 
 def db(x, floor=1e-12):
     return 20.0 * np.log10(np.maximum(np.abs(x), floor))
@@ -110,11 +154,14 @@ class BandRow:
 class RemezApp:
     def __init__(self, root):
         self.root = root
-        root.title("Remez exchange FIR filter designer")
-        root.geometry("1360x860")
+        root.title("Digital filter designer — Remez FIR and classical IIR")
+        root.geometry("1360x900")
         self.rows = []
         self.result = None
+        self.iir_result = None
         self.spec_dev = None
+        self.mode = tk.StringVar(value=MODE_FIR)
+        self.view = tk.StringVar(value=VIEW_PLOT)
 
         paned = ttk.PanedWindow(root, orient="horizontal")
         paned.pack(fill="both", expand=True)
@@ -139,10 +186,15 @@ class RemezApp:
             root.bind(key, lambda e: self.design())
 
     def _place_sash(self):
-        """Give the controls the width they asked for, the plot the rest."""
+        """Give the controls the width they asked for, the plot the rest.
+
+        Called again on a mode switch, since the two panels do not ask for the
+        same width, but only ever to widen: a sash the user has dragged out is
+        theirs, and shuffling it on every switch would be maddening.
+        """
         try:
             want = max(self.paned.winfo_children()[0].winfo_reqwidth(), 380)
-            if self.paned.winfo_width() > want + 200:
+            if self.paned.winfo_width() > want + 200 and self.paned.sashpos(0) < want:
                 self.paned.sashpos(0, want)
         except (tk.TclError, IndexError):
             pass
@@ -150,6 +202,69 @@ class RemezApp:
     # ---------------------------------------------------------------- controls
 
     def _build_controls(self, parent):
+        """Mode selector, the two mode panels, and the shared bottom half."""
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        parent.rowconfigure(4, weight=1)
+
+        sel = ttk.Frame(parent)
+        sel.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        sel.columnconfigure(1, weight=1)
+        ttk.Label(sel, text="Mode").grid(row=0, column=0, sticky="w")
+        combo = ttk.Combobox(sel, textvariable=self.mode, state="readonly",
+                             values=MODES, width=24)
+        combo.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        combo.bind("<<ComboboxSelected>>", lambda e: self.switch_mode())
+
+        self.fir_panel = ttk.Frame(parent)
+        self.iir_panel = ttk.Frame(parent)
+        for panel in (self.fir_panel, self.iir_panel):
+            panel.grid(row=1, column=0, sticky="nsew")
+        self._build_fir_controls(self.fir_panel)
+        self._build_iir_controls(self.iir_panel)
+        self.iir_panel.grid_remove()
+
+        self._build_actions(parent)
+        self._build_display(parent)
+        self._build_report(parent)
+
+    def _build_actions(self, parent):
+        act = ttk.Frame(parent)
+        act.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(act, text="Design  (Ctrl+Enter)", command=self.design).pack(side="left")
+        ttk.Button(act, text="Save coefficients…",
+                   command=self.save_coefficients).pack(side="left", padx=4)
+        ttk.Button(act, text="Save plot…", command=self.save_plot).pack(side="left")
+
+    def _build_display(self, parent):
+        opt = ttk.LabelFrame(parent, text="Display", padding=6)
+        opt.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self.log_scale = tk.BooleanVar(value=True)
+        self.show_spec = tk.BooleanVar(value=True)
+        self.show_ext = tk.BooleanVar(value=True)
+        for i, (text, var) in enumerate([
+                ("Magnitude in dB", self.log_scale),
+                ("Show constraints", self.show_spec),
+                ("Show extremal frequencies", self.show_ext)]):
+            w = ttk.Checkbutton(opt, text=text, variable=var, command=self.redraw)
+            w.grid(row=i, column=0, sticky="w")
+            if var is self.show_ext:
+                self.ext_check = w          # FIR only; greyed out in IIR mode
+
+    def _build_report(self, parent):
+        rbox = ttk.LabelFrame(parent, text="Result", padding=6)
+        rbox.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
+        rbox.columnconfigure(0, weight=1)
+        rbox.rowconfigure(0, weight=1)
+        self.report = tk.Text(rbox, width=44, height=14, wrap="none",
+                              font=("Menlo", 10), relief="flat")
+        self.report.grid(row=0, column=0, sticky="nsew")
+        self.report.configure(state="disabled")
+        sb = ttk.Scrollbar(rbox, orient="vertical", command=self.report.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.report.configure(yscrollcommand=sb.set)
+
+    def _build_fir_controls(self, parent):
         parent.columnconfigure(0, weight=1)
 
         # --- filter parameters -------------------------------------------
@@ -216,51 +331,174 @@ class RemezApp:
                              "passband ripple dB p-p / stopband atten. dB"
                         ).grid(row=2, column=0, sticky="w", pady=(6, 0))
 
-        # --- actions -------------------------------------------------------
-        act = ttk.Frame(parent)
-        act.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(act, text="Design  (Ctrl+Enter)", command=self.design).pack(side="left")
-        ttk.Button(act, text="Save coefficients…",
-                   command=self.save_coefficients).pack(side="left", padx=4)
-        ttk.Button(act, text="Save plot…", command=self.save_plot).pack(side="left")
+    def _build_iir_controls(self, parent):
+        parent.columnconfigure(0, weight=1)
 
-        # --- display options -------------------------------------------------
-        opt = ttk.LabelFrame(parent, text="Display", padding=6)
-        opt.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        self.log_scale = tk.BooleanVar(value=True)
-        self.show_spec = tk.BooleanVar(value=True)
-        self.show_ext = tk.BooleanVar(value=True)
-        for i, (text, var) in enumerate([
-                ("Magnitude in dB", self.log_scale),
-                ("Show constraints", self.show_spec),
-                ("Show extremal frequencies", self.show_ext)]):
-            ttk.Checkbutton(opt, text=text, variable=var,
-                            command=self.redraw).grid(row=i, column=0, sticky="w")
+        self.response = tk.StringVar(value="Lowpass")
+        self.approximation = tk.StringVar(value="Elliptic")
+        self.iir_order = tk.IntVar(value=6)
+        self.auto_order = tk.BooleanVar(value=True)
+        self.iir_preset = tk.StringVar(value="Elliptic lowpass")
 
-        # --- results ---------------------------------------------------------
-        rbox = ttk.LabelFrame(parent, text="Result", padding=6)
-        rbox.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
-        rbox.columnconfigure(0, weight=1)
-        rbox.rowconfigure(0, weight=1)
-        self.report = tk.Text(rbox, width=44, height=14, wrap="none",
-                              font=("Menlo", 10), relief="flat")
-        self.report.grid(row=0, column=0, sticky="nsew")
-        self.report.configure(state="disabled")
-        sb = ttk.Scrollbar(rbox, orient="vertical", command=self.report.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        self.report.configure(yscrollcommand=sb.set)
+        # --- filter parameters -------------------------------------------
+        box = ttk.LabelFrame(parent, text="Filter", padding=6)
+        box.grid(row=0, column=0, sticky="ew")
+        box.columnconfigure(1, weight=1)
+        box.columnconfigure(3, weight=1)
+
+        ttk.Label(box, text="Response").grid(row=0, column=0, sticky="w")
+        resp = ttk.Combobox(box, textvariable=self.response, state="readonly",
+                            width=14, values=list(RESPONSE_LABELS))
+        resp.grid(row=0, column=1, columnspan=3, sticky="ew", padx=2)
+        resp.bind("<<ComboboxSelected>>",
+                  lambda e: (self._edge_fields_for_response(), self.design()))
+
+        ttk.Label(box, text="Approximation").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        appr = ttk.Combobox(box, textvariable=self.approximation, state="readonly",
+                            width=14, values=list(APPROX_LABELS))
+        appr.grid(row=1, column=1, columnspan=3, sticky="ew", padx=2, pady=(4, 0))
+        appr.bind("<<ComboboxSelected>>", lambda e: self.design())
+
+        ttk.Label(box, text="Order (N)").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.order_spin = ttk.Spinbox(box, from_=1, to=40, textvariable=self.iir_order,
+                                      width=8, command=self.design)
+        self.order_spin.grid(row=2, column=1, sticky="ew", padx=(2, 8), pady=(4, 0))
+        ttk.Checkbutton(box, text="smallest that meets the spec",
+                        variable=self.auto_order, command=self._auto_order_toggled
+                        ).grid(row=2, column=2, columnspan=2, sticky="w", pady=(4, 0))
+
+        # The sample rate is shared with FIR mode: it is a property of the
+        # signal, not of how the filter happens to be designed.
+        ttk.Label(box, text="Sample rate").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(box, textvariable=self.fs, width=10).grid(
+            row=3, column=1, sticky="ew", padx=(2, 8), pady=(4, 0))
+
+        ttk.Label(box, text="Preset").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        pre = ttk.Combobox(box, textvariable=self.iir_preset, state="readonly",
+                           width=14, values=list(IIR_PRESETS))
+        pre.grid(row=4, column=1, columnspan=3, sticky="ew", padx=2, pady=(4, 0))
+        pre.bind("<<ComboboxSelected>>",
+                 lambda e: (self.load_iir_preset(self.iir_preset.get()), self.design()))
+
+        # --- the specification --------------------------------------------
+        sbox = ttk.LabelFrame(parent, text="Bands and specification", padding=6)
+        sbox.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        for c in (1, 2):
+            sbox.columnconfigure(c, weight=1)
+
+        ttk.Label(sbox, text="lower", anchor="center").grid(row=0, column=1, sticky="ew")
+        self.edge_hi_label = ttk.Label(sbox, text="upper", anchor="center")
+        self.edge_hi_label.grid(row=0, column=2, sticky="ew")
+
+        self.iir_wp = [tk.StringVar(value="0.2"), tk.StringVar(value="0.4")]
+        self.iir_ws = [tk.StringVar(value="0.25"), tk.StringVar(value="0.45")]
+        self.edge_entries = {}
+        for row, (text, vars_) in enumerate([("Passband edge", self.iir_wp),
+                                             ("Stopband edge", self.iir_ws)], start=1):
+            ttk.Label(sbox, text=text).grid(row=row, column=0, sticky="w", pady=1)
+            widgets = []
+            for col, var in enumerate(vars_):
+                e = ttk.Entry(sbox, textvariable=var, width=9, justify="right")
+                e.grid(row=row, column=col + 1, sticky="ew", padx=2, pady=1)
+                e.bind("<Return>", lambda ev: self.design())
+                widgets.append(e)
+            self.edge_entries[text] = widgets
+
+        self.iir_rp = tk.DoubleVar(value=0.5)
+        self.iir_rs = tk.DoubleVar(value=60.0)
+        for row, (text, var) in enumerate([("Passband ripple (dB p-p)", self.iir_rp),
+                                           ("Stopband attenuation (dB)", self.iir_rs)],
+                                          start=3):
+            ttk.Label(sbox, text=text).grid(row=row, column=0, sticky="w", pady=(4, 0))
+            e = ttk.Entry(sbox, textvariable=var, width=9, justify="right")
+            e.grid(row=row, column=1, sticky="ew", padx=2, pady=(4, 0))
+            e.bind("<Return>", lambda ev: self.design())
+
+        ttk.Label(sbox, wraplength=300, foreground="#555",
+                  text="Chebyshev II is placed on the stopband edge and the other "
+                       "three on the passband edge; the opposite edge is where the "
+                       "order is worked out from."
+                  ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        self._edge_fields_for_response()
+        self._auto_order_toggled(design=False)
 
     def _build_plot(self, parent):
-        self.fig = Figure(figsize=(8, 8), layout="constrained")
-        gs = self.fig.add_gridspec(4, 1, height_ratios=[2.6, 1.2, 1.3, 1.1])
-        self.ax_mag = self.fig.add_subplot(gs[0])
-        self.ax_detail = self.fig.add_subplot(gs[1])
-        self.ax_err = self.fig.add_subplot(gs[2])
-        self.ax_imp = self.fig.add_subplot(gs[3])
+        bar = ttk.Frame(parent, padding=(6, 4))
+        bar.pack(fill="x")
+        ttk.Label(bar, text="View").pack(side="left")
+        combo = ttk.Combobox(bar, textvariable=self.view, state="readonly",
+                             values=VIEWS, width=14)
+        combo.pack(side="left", padx=(6, 0))
+        combo.bind("<<ComboboxSelected>>", lambda e: self.switch_view())
+        self.view_hint = ttk.Label(bar, foreground="#666", text="")
+        self.view_hint.pack(side="left", padx=(10, 0))
 
+        self.fig = Figure(figsize=(8, 8), layout="constrained")
         self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         NavigationToolbar2Tk(self.canvas, parent).update()
+        self._layout_axes()
+
+    def _layout_axes(self):
+        """Lay the figure out for the current mode and view.
+
+        Nothing survives a switch: the two modes have nothing useful in common
+        to plot -- an equiripple error curve means nothing for an IIR filter,
+        and a pole-zero pattern means nothing for an FIR one -- and the design
+        view is one bare set of axes rather than a stack of them.
+        """
+        self.fig.clear()
+        self.view_hint.configure(
+            text="the structure you would build, with its actual constants"
+            if self.is_design() else "")
+        if self.is_design():
+            self.ax_design = self.fig.add_subplot(111)
+            self.ax_design.set_axis_off()
+        elif self.is_iir():
+            gs = self.fig.add_gridspec(4, 2, height_ratios=[2.5, 1.2, 1.2, 1.5])
+            self.ax_imag = self.fig.add_subplot(gs[0, :])
+            self.ax_idetail = self.fig.add_subplot(gs[1, :])
+            self.ax_delay = self.fig.add_subplot(gs[2, :])
+            self.ax_phase = self.ax_delay.twinx()
+            self.ax_pz = self.fig.add_subplot(gs[3, 0])
+            self.ax_step = self.fig.add_subplot(gs[3, 1])
+            self.ax_imp2 = self.ax_step.twinx()
+        else:
+            gs = self.fig.add_gridspec(4, 1, height_ratios=[2.6, 1.2, 1.3, 1.1])
+            self.ax_mag = self.fig.add_subplot(gs[0])
+            self.ax_detail = self.fig.add_subplot(gs[1])
+            self.ax_err = self.fig.add_subplot(gs[2])
+            self.ax_imp = self.fig.add_subplot(gs[3])
+
+    # --------------------------------------------------------- mode and view
+
+    def is_iir(self):
+        return self.mode.get() == MODE_IIR
+
+    def is_design(self):
+        return self.view.get() == VIEW_DESIGN
+
+    def switch_view(self):
+        """Swap between the response plots and the structure diagram."""
+        self._layout_axes()
+        if (self.iir_result if self.is_iir() else self.result) is None:
+            self.design()
+        else:
+            self.redraw()
+
+    def switch_mode(self):
+        """Show the panel and the axes belonging to the newly selected mode."""
+        if self.is_iir():
+            self.fir_panel.grid_remove()
+            self.iir_panel.grid()
+        else:
+            self.iir_panel.grid_remove()
+            self.fir_panel.grid()
+        self.ext_check.configure(state="disabled" if self.is_iir() else "normal")
+        self._layout_axes()
+        self.design()
+        self._place_sash()
 
     # ------------------------------------------------------------------- table
 
@@ -310,6 +548,49 @@ class RemezApp:
             r.set_spec_state(self.use_spec.get())
         self.design()
 
+    # -------------------------------------------------------------- IIR inputs
+
+    def _edge_fields_for_response(self):
+        """A lowpass or highpass has one edge of each kind; the band types two."""
+        two = RESPONSE_LABELS[self.response.get()] in ("bandpass", "bandstop")
+        for widgets in self.edge_entries.values():
+            widgets[1].configure(state="normal" if two else "disabled")
+        self.edge_hi_label.configure(foreground="" if two else "#999")
+
+    def _auto_order_toggled(self, design=True):
+        self.order_spin.configure(state="disabled" if self.auto_order.get() else "normal")
+        if design:
+            self.design()
+
+    def load_iir_preset(self, name):
+        response, approximation, wp, ws, rp, rs, order = IIR_PRESETS[name]
+        fs = self.fs.get() or 1.0
+        self.response.set(_RESPONSE_NAMES[response])
+        self.approximation.set(_APPROX_NAMES[approximation])
+        for var, edges in ((self.iir_wp, wp), (self.iir_ws, ws)):
+            for i, f in enumerate(edges):
+                var[i].set(f"{f * fs:g}")
+        self.iir_rp.set(rp)
+        self.iir_rs.set(rs)
+        self.auto_order.set(order is None)
+        if order is not None:
+            self.iir_order.set(order)
+        self._edge_fields_for_response()
+        self._auto_order_toggled(design=False)
+
+    def read_iir_spec(self):
+        """The IIR specification as the core module wants it."""
+        response = RESPONSE_LABELS[self.response.get()]
+        n = 2 if response in ("bandpass", "bandstop") else 1
+        try:
+            wp = [float(v.get()) for v in self.iir_wp[:n]]
+            ws = [float(v.get()) for v in self.iir_ws[:n]]
+            rp = float(self.iir_rp.get())
+            rs = float(self.iir_rs.get())
+        except (ValueError, tk.TclError):
+            raise ii.IIRError("every band edge and dB figure must be a number")
+        return response, APPROX_LABELS[self.approximation.get()], wp, ws, rp, rs
+
     # ------------------------------------------------------------------ design
 
     def read_bands(self):
@@ -349,6 +630,11 @@ class RemezApp:
         return bands
 
     def design(self, *_):
+        if self.is_iir():
+            return self.design_iir()
+        return self.design_fir()
+
+    def design_fir(self):
         try:
             bands = self.read_bands()
             self.result = rz.design(
@@ -365,20 +651,56 @@ class RemezApp:
         self.redraw()
         self._report()
 
+    def design_iir(self):
+        try:
+            response, approximation, wp, ws, rp, rs = self.read_iir_spec()
+            order = None if self.auto_order.get() else int(self.iir_order.get())
+            self.iir_result = ii.design(
+                response, approximation, wp=wp, ws=ws, rp=rp, rs=rs,
+                order=order, fs=float(self.fs.get()),
+            )
+        except (ii.IIRError, ValueError, tk.TclError) as exc:
+            self.iir_result = None
+            self._fail(str(exc))
+            return
+        if self.auto_order.get():
+            self.iir_order.set(self.iir_result.order)
+        self.redraw()
+        self._report()
+
     def _fail(self, message):
         self.report.configure(state="normal")
         self.report.delete("1.0", "end")
         self.report.insert("1.0", "Cannot design this filter:\n\n" + message)
         self.report.configure(state="disabled")
-        for ax in (self.ax_mag, self.ax_detail, self.ax_err, self.ax_imp):
+        for ax in self.fig.axes:
             ax.clear()
-        self.ax_mag.text(0.5, 0.5, "no filter", ha="center", va="center",
-                         transform=self.ax_mag.transAxes, color="0.6")
+        first = self.fig.axes[0]
+        first.text(0.5, 0.5, "no filter", ha="center", va="center",
+                   transform=first.transAxes, color="0.6")
         self.canvas.draw_idle()
 
     # ----------------------------------------------------------------- drawing
 
     def redraw(self):
+        if self.is_design():
+            return self.redraw_design()
+        if self.is_iir():
+            return self.redraw_iir()
+        return self.redraw_fir()
+
+    def redraw_design(self):
+        """The current filter drawn as adders, delays and multipliers."""
+        res = self.iir_result if self.is_iir() else self.result
+        if res is None:
+            return
+        if self.is_iir():
+            draw_iir_structure(self.ax_design, res)
+        else:
+            draw_fir_structure(self.ax_design, res)
+        self.canvas.draw_idle()
+
+    def redraw_fir(self):
         res = self.result
         if res is None:
             return
@@ -551,9 +873,247 @@ class RemezApp:
             ax.text(0.5, 0.5, "every band targets zero", ha="center", va="center",
                     transform=ax.transAxes, color="0.6", fontsize=9)
 
+    # ------------------------------------------------------------- IIR drawing
+
+    def redraw_iir(self):
+        res = self.iir_result
+        if res is None:
+            return
+        nyq = res.fs / 2.0
+        f = np.linspace(0.0, nyq, 4096)
+        h = res.response_at(f)
+        mag = np.abs(h)
+        log = self.log_scale.get()
+
+        # ---- magnitude -----------------------------------------------------
+        ax = self.ax_imag
+        ax.clear()
+        ax.plot(f, db(mag) if log else mag, lw=1.2, color="#1f77b4",
+                label="designed response", zorder=3)
+        if self.show_spec.get():
+            self._draw_iir_mask(ax, res, log)
+        ax.set_xlim(0, nyq)
+        if log:
+            ax.set_ylim(max(-1.6 * res.rs - 20.0, -220.0), 5.0)
+            ax.set_ylabel("magnitude (dB)")
+        else:
+            ax.set_ylim(-0.05, 1.15)
+            ax.set_ylabel("magnitude")
+        ax.set_xlabel(f"frequency ({'normalised' if res.fs == 1.0 else 'Hz'})")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+        ax.set_title(
+            f"{_APPROX_NAMES[res.approximation]} {res.response}, order {res.order}"
+            f"   —   {len(res.sos)} biquad{'s' if len(res.sos) != 1 else ''}"
+            f"{'' if res.stable else '   *** UNSTABLE ***'}")
+
+        # ---- passband detail ------------------------------------------------
+        ax = self.ax_idetail
+        ax.clear()
+        for a, b in res.passband_ranges:
+            bf = np.linspace(a, b, 800)
+            ax.plot(bf, db(np.abs(res.response_at(bf))), lw=1.2, color="#1f77b4",
+                    zorder=3)
+        ax.axhline(0.0, color="#ff7f0e", lw=1.2, ls="--", zorder=2)
+        ax.axhline(-res.rp, color="#ff7f0e", lw=1.2, ls="--", zorder=2,
+                   label=f"−{res.rp:g} dB")
+        # Zoom onto the passband: for a lowpass this is a fraction of the axis,
+        # and a fraction of a dB of ripple is invisible spread over the rest.
+        lo = min(a for a, _ in res.passband_ranges)
+        hi = max(b for _, b in res.passband_ranges)
+        pad = 0.02 * (hi - lo)
+        ax.set_xlim(max(0.0, lo - pad), min(nyq, hi + pad))
+        ax.set_ylim(-1.8 * res.rp, 0.8 * res.rp)
+        ax.set_ylabel("passband (dB)")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="lower left", fontsize=8, framealpha=0.9)
+        ax.set_title(f"passband ripple   —   {res.achieved_rp:.4g} dB p-p achieved",
+                     fontsize=9)
+
+        # ---- group delay and phase -------------------------------------------
+        ax, axp = self.ax_delay, self.ax_phase
+        ax.clear()
+        axp.clear()
+        w = np.linspace(1e-4, np.pi - 1e-4, 2048)
+        gf = w * res.fs / (2.0 * np.pi)
+        ax.plot(gf, ii.group_delay(res.sos, w), lw=1.1, color="#9467bd")
+        axp.plot(gf, np.unwrap(np.angle(ii.sos_freqz(res.sos, w))) * 180.0 / np.pi,
+                 lw=0.9, color="#8c564b", alpha=0.65)
+        for a, b in res.passband_ranges:
+            ax.axvspan(a, b, color="#ff7f0e", alpha=0.10, zorder=0)
+        ax.set_xlim(0, nyq)
+        ax.set_ylabel("group delay (samples)", color="#9467bd")
+        axp.set_ylabel("phase (deg)", color="#8c564b")
+        ax.grid(alpha=0.3)
+        ax.set_title("group delay, shaded over the passband, with the unwrapped "
+                     "phase behind it", fontsize=9)
+
+        # ---- pole-zero pattern -----------------------------------------------
+        ax = self.ax_pz
+        ax.clear()
+        t = np.linspace(0, 2 * np.pi, 361)
+        ax.plot(np.cos(t), np.sin(t), color="0.7", lw=0.9)
+        ax.axhline(0, color="0.85", lw=0.7)
+        ax.axvline(0, color="0.85", lw=0.7)
+        if len(res.z):
+            ax.plot(res.z.real, res.z.imag, "o", ms=6, mfc="none", mew=1.2,
+                    color="#1f77b4", label="zeros")
+        ax.plot(res.p.real, res.p.imag, "x", ms=6, mew=1.4, color="#d62728",
+                label="poles")
+        # A Butterworth's zeros all sit on top of each other at Nyquist, which
+        # otherwise reads as a single zero.
+        for roots, colour in ((res.z, "#1f77b4"), (res.p, "#d62728")):
+            for root, count in self._multiplicities(roots):
+                if count > 1:
+                    ax.annotate(f"×{count}", (root.real, root.imag),
+                                textcoords="offset points", xytext=(5, 4),
+                                fontsize=7, color=colour)
+        lim = max(1.15, float(np.max(np.abs(np.r_[res.z, res.p]))) * 1.1
+                  if len(res.z) or len(res.p) else 1.15)
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
+        ax.set_title(f"poles and zeros   —   max |p| = {res.max_pole_radius:.4f}",
+                     fontsize=9)
+
+        # ---- impulse and step response ----------------------------------------
+        ax, axi = self.ax_step, self.ax_imp2
+        ax.clear()
+        axi.clear()
+        n = self._settling_length(res)
+        imp = ii.sos_impulse(res.sos, n)
+        step = np.cumsum(imp)
+        k = np.arange(n)
+        # A sharp filter's impulse response is a hundred times smaller than the
+        # step it integrates to, so the two get their own scales.
+        axi.plot(k, imp, lw=0.8, color="#2ca02c", alpha=0.8, label="impulse")
+        ax.plot(k, step, lw=1.1, color="#1f77b4", label="step")
+        ax.axhline(0.0, color="0.85", lw=0.7)
+        ax.set_xlim(0, n - 1)
+        ax.set_xlabel("sample")
+        ax.set_ylabel("step", color="#1f77b4")
+        axi.set_ylabel("impulse", color="#2ca02c")
+        ax.set_zorder(axi.get_zorder() + 1)
+        ax.patch.set_visible(False)
+        ax.grid(alpha=0.3)
+        ax.set_title("impulse and step response", fontsize=9)
+
+        self.canvas.draw_idle()
+
+    @staticmethod
+    def _multiplicities(roots, tol=1e-9):
+        """Group coincident roots into (root, count) pairs."""
+        out = []
+        for r in roots:
+            for i, (seen, count) in enumerate(out):
+                if abs(r - seen) <= tol:
+                    out[i] = (seen, count + 1)
+                    break
+            else:
+                out.append((r, 1))
+        return out
+
+    @staticmethod
+    def _settling_length(res, cap=1024):
+        """Enough samples for the slowest pole to decay by about 60 dB."""
+        r = min(res.max_pole_radius, 1.0 - 1e-9)
+        n = 60.0 / max(-20.0 * np.log10(r), 1e-6) if r > 0 else 32
+        return int(np.clip(n, 48, cap))
+
+    def _draw_iir_mask(self, ax, res, log):
+        """The specification as the corridors the response has to stay inside."""
+        rp_lo = 10.0 ** (-res.rp / 20.0)
+        rs_hi = 10.0 ** (-res.rs / 20.0)
+        first = True
+        for a, b in res.passband_ranges:
+            lo, hi = (db(rp_lo), 0.0) if log else (rp_lo, 1.0)
+            ax.fill_between([a, b], lo, hi, color="#ff7f0e", alpha=0.18, zorder=1,
+                            label="passband corridor" if first else None)
+            first = False
+        first = True
+        for a, b in res.stopband_ranges:
+            lo, hi = (-400.0, db(rs_hi)) if log else (0.0, rs_hi)
+            ax.fill_between([a, b], lo, hi, color="#7f7f7f", alpha=0.18, zorder=1,
+                            label="stopband limit" if first else None)
+            first = False
+        for edge in res.wp + res.ws:
+            ax.axvline(edge, color="0.75", lw=0.7, zorder=0)
+
     # ------------------------------------------------------------------ report
 
     def _report(self):
+        if self.is_iir():
+            return self._report_iir()
+        return self._report_fir()
+
+    def _write_report(self, lines):
+        self.report.configure(state="normal")
+        self.report.delete("1.0", "end")
+        self.report.insert("1.0", "\n".join(lines))
+        self.report.configure(state="disabled")
+
+    def _report_iir(self):
+        res = self.iir_result
+        out = []
+        out.append(f"{_APPROX_NAMES[res.approximation]} {res.response}")
+        out.append(f"order            {res.order}"
+                   f"{'  (smallest that meets the spec)' if res.auto_order else ''}")
+        out.append(f"digital degree   {res.degree}   "
+                   f"({len(res.sos)} second-order section"
+                   f"{'s' if len(res.sos) != 1 else ''})")
+        out.append(f"smallest order   {res.order_estimate}")
+        out.append(f"max |pole|       {res.max_pole_radius:.6f}   "
+                   f"{'stable' if res.stable else '*** UNSTABLE ***'}")
+        out.append("")
+
+        out.append("spec check")
+        rp_verdict = "met" if res.achieved_rp <= res.rp * 1.0001 + 1e-9 else "MISSED"
+        rs_verdict = "met" if res.achieved_rs >= res.rs - 1e-4 else "MISSED"
+        out.append(f"  passband ripple  achieved {res.achieved_rp:8.4g} dB  "
+                   f"required {res.rp:8.4g} dB   {rp_verdict}")
+        out.append(f"  stopband atten.  achieved {res.achieved_rs:8.4g} dB  "
+                   f"required {res.rs:8.4g} dB   {rs_verdict}")
+        if not res.meets_spec and not res.auto_order:
+            out.append(f"  raise the order to {res.order_estimate} to meet both")
+        elif not res.meets_spec:
+            # Only reachable for a band response whose edges are not
+            # geometrically symmetric about the band centre.
+            out.append("  the band edges are not geometrically symmetric, so one")
+            out.append("  transition is wider than asked for; nudge an edge or")
+            out.append("  raise the order by one.")
+        out.append("")
+
+        edges = ", ".join(f"{v:g}" for v in res.wn)
+        out.append(f"placed on        {edges}"
+                   f"  ({'stopband' if res.approximation == 'chebyshev2' else 'passband'}"
+                   f" edge)")
+        out.append(f"sample rate      {res.fs:g}")
+        out.append("")
+
+        out.append("second-order sections   b0 b1 b2 / a0 a1 a2")
+        for i, s in enumerate(res.sos):
+            out.append(f"  [{i}] b {s[0]: .12f} {s[1]: .12f} {s[2]: .12f}")
+            out.append(f"      a {s[3]: .12f} {s[4]: .12f} {s[5]: .12f}")
+        out.append("")
+
+        out.append("poles (radius, frequency)")
+        for p in sorted(res.p, key=lambda q: (abs(np.angle(q)), -abs(q))):
+            f = abs(np.angle(p)) * res.fs / (2.0 * np.pi)
+            out.append(f"  {p.real: .9f} {p.imag:+.9f}j   "
+                       f"|p| = {abs(p):.6f}   f = {f:.6g}")
+        if len(res.z):
+            out.append("")
+            out.append("zeros")
+            for z in sorted(res.z, key=lambda q: (abs(np.angle(q)), -abs(q))):
+                f = abs(np.angle(z)) * res.fs / (2.0 * np.pi)
+                out.append(f"  {z.real: .9f} {z.imag:+.9f}j   "
+                           f"|z| = {abs(z):.6f}   f = {f:.6g}")
+
+        self._write_report(out)
+
+    def _report_fir(self):
         res = self.result
         out = []
         out.append(f"type {res.ftype}  ({res.symmetry}, "
@@ -595,10 +1155,7 @@ class RemezApp:
         for i, v in enumerate(res.h):
             out.append(f"  h[{i:<4d}] = {v: .12f}")
 
-        self.report.configure(state="normal")
-        self.report.delete("1.0", "end")
-        self.report.insert("1.0", "\n".join(out))
-        self.report.configure(state="disabled")
+        self._write_report(out)
 
     def _suggest_taps(self, res):
         """Kaiser's order estimate over the narrowest transition band."""
@@ -617,7 +1174,8 @@ class RemezApp:
     # ------------------------------------------------------------------ export
 
     def save_coefficients(self):
-        if self.result is None:
+        res = self.iir_result if self.is_iir() else self.result
+        if res is None:
             return
         path = filedialog.asksaveasfilename(
             title="Save coefficients",
@@ -625,28 +1183,58 @@ class RemezApp:
             filetypes=[("CSV", "*.csv"), ("C header", "*.h"), ("Text", "*.txt")])
         if not path:
             return
-        res = self.result
+        lines = (self._iir_export(res, path) if self.is_iir()
+                 else self._fir_export(res, path))
         try:
-            if path.endswith(".h"):
-                lines = [f"/* Parks-McClellan FIR, type {res.ftype}, "
-                         f"N = {res.numtaps}, delta = {abs(res.delta):.6g} */",
-                         f"#define FIR_TAPS {res.numtaps}",
-                         "static const double fir_coeffs[FIR_TAPS] = {"]
-                lines += [f"    {v: .17g}," for v in res.h]
-                lines += ["};", ""]
-            else:
-                lines = [f"# Parks-McClellan FIR, type {res.ftype}, "
-                         f"N = {res.numtaps}, fs = {res.fs:g}",
-                         f"# weighted delta = {abs(res.delta):.10g}",
-                         "n,h"]
-                lines += [f"{i},{v:.17g}" for i, v in enumerate(res.h)]
             with open(path, "w") as fh:
                 fh.write("\n".join(lines) + "\n")
         except OSError as exc:
             messagebox.showerror("Save failed", str(exc))
 
+    @staticmethod
+    def _iir_export(res, path):
+        """Biquad sections, as CSV or as a C table ready to cascade."""
+        head = (f"{_APPROX_NAMES[res.approximation]} {res.response}, "
+                f"order {res.order}, fs = {res.fs:g}, "
+                f"{res.rp:g} dB / {res.rs:g} dB")
+        if path.endswith(".h"):
+            lines = [f"/* {head} */",
+                     f"/* cascade of {len(res.sos)} biquads, "
+                     "each y = b0 x + b1 x' + b2 x'' - a1 y' - a2 y'' */",
+                     f"#define IIR_SECTIONS {len(res.sos)}",
+                     "static const double iir_sos[IIR_SECTIONS][6] = {"]
+            lines += ["    {" + ", ".join(f"{v: .17g}" for v in s) + "},"
+                      for s in res.sos]
+            lines += ["};", ""]
+            return lines
+        lines = [f"# {head}",
+                 f"# max |pole| = {res.max_pole_radius:.10g}, "
+                 f"achieved {res.achieved_rp:.4g} dB / {res.achieved_rs:.4g} dB",
+                 "section,b0,b1,b2,a0,a1,a2"]
+        lines += [str(i) + "," + ",".join(f"{v:.17g}" for v in s)
+                  for i, s in enumerate(res.sos)]
+        return lines
+
+    @staticmethod
+    def _fir_export(res, path):
+        """The impulse response, as CSV or as a C array."""
+        if path.endswith(".h"):
+            lines = [f"/* Parks-McClellan FIR, type {res.ftype}, "
+                     f"N = {res.numtaps}, delta = {abs(res.delta):.6g} */",
+                     f"#define FIR_TAPS {res.numtaps}",
+                     "static const double fir_coeffs[FIR_TAPS] = {"]
+            lines += [f"    {v: .17g}," for v in res.h]
+            lines += ["};", ""]
+            return lines
+        lines = [f"# Parks-McClellan FIR, type {res.ftype}, "
+                 f"N = {res.numtaps}, fs = {res.fs:g}",
+                 f"# weighted delta = {abs(res.delta):.10g}",
+                 "n,h"]
+        lines += [f"{i},{v:.17g}" for i, v in enumerate(res.h)]
+        return lines
+
     def save_plot(self):
-        if self.result is None:
+        if (self.iir_result if self.is_iir() else self.result) is None:
             return
         path = filedialog.asksaveasfilename(
             title="Save plot", defaultextension=".png",
@@ -656,6 +1244,262 @@ class RemezApp:
                 self.fig.savefig(path, dpi=150)
             except (OSError, ValueError) as exc:
                 messagebox.showerror("Save failed", str(exc))
+
+
+# --------------------------------------------------------------------------
+# Structure diagrams
+#
+# The design view draws the filter as the thing you would actually build: the
+# adders, the unit delays and the multipliers, each labelled with the constant
+# that goes into it.  Everything is laid out in axes coordinates running 0..1
+# in both directions, and every symbol is drawn as a marker, a text box or an
+# annotation arrow -- all of which are sized in points -- so nothing is
+# distorted when the pane is resized to some other aspect ratio.
+# --------------------------------------------------------------------------
+
+_WIRE = "#555"
+_GAIN_COLOUR = "#1f77b4"
+_DEAD_COLOUR = "#c8c8c8"
+
+
+def _line(ax, x1, y1, x2, y2, colour=_WIRE, lw=1.0):
+    ax.plot([x1, x2], [y1, y2], color=colour, lw=lw, solid_capstyle="round",
+            zorder=2)
+
+
+def _arrow(ax, x1, y1, x2, y2, colour=_WIRE, lw=1.0, shrink_a=0.0, shrink_b=0.0):
+    ax.annotate("", xy=(x2, y2), xytext=(x1, y1), zorder=2,
+                arrowprops=dict(arrowstyle="-|>", color=colour, lw=lw,
+                                shrinkA=shrink_a, shrinkB=shrink_b,
+                                mutation_scale=9))
+
+
+def _node(ax, x, y, colour=_WIRE):
+    ax.plot([x], [y], marker="o", ms=3.0, color=colour, zorder=3)
+
+
+def _adder(ax, x, y, size, colour=_WIRE):
+    ax.plot([x], [y], marker="o", ms=size, mfc="white", mec=colour, mew=1.0,
+            zorder=4)
+    ax.text(x, y, "+", ha="center", va="center", fontsize=size * 0.75,
+            color=colour, zorder=5)
+
+
+def _delay(ax, x, y, fontsize, colour=_WIRE):
+    ax.text(x, y, "z⁻¹", ha="center", va="center", fontsize=fontsize,
+            color=colour, zorder=5,
+            bbox=dict(boxstyle="square,pad=0.28", fc="white", ec=colour, lw=0.9))
+
+
+_FACING = {"right": -90, "left": 90, "down": 180}
+
+
+def _gain(ax, x, y, label, fontsize, facing="right", dy=7, colour=_GAIN_COLOUR):
+    """A multiplier triangle pointing the way the signal flows, and its value."""
+    ax.plot([x], [y], marker=(3, 0, _FACING[facing]), ms=9,
+            mfc="white", mec=colour, mew=1.0, zorder=4)
+    if label:
+        ax.annotate(label, (x, y), textcoords="offset points", xytext=(0, dy),
+                    ha="center", va="bottom" if dy > 0 else "top",
+                    fontsize=fontsize, color=colour, zorder=5)
+
+
+def _draw_biquad(ax, coeffs, box, in_label, out_label, title, fontsize):
+    """One second-order section, as transposed direct form II.
+
+    This is the structure ``iir_core.sos_filter`` actually runs and the one the
+    exported coefficients are meant for: two state variables, the numerator
+    taps feeding forward off the input and the denominator taps feeding back
+    off the output, so that
+
+        y[n]  = b0 x[n] + s1[n-1]
+        s1[n] = b1 x[n] - a1 y[n] + s2[n-1]
+        s2[n] = b2 x[n] - a2 y[n]
+
+    A first-order section reaches here padded with zeros; those branches are
+    drawn in grey rather than dropped, so that the picture and the six exported
+    numbers stay in step.
+    """
+    b0, b1, b2, _, a1, a2 = coeffs / coeffs[3]
+    x0, y0, w, h = box
+
+    def X(u):
+        return x0 + u * w
+
+    def Y(v):
+        return y0 + v * h
+
+    in_x, add_x, out_x = 0.235, 0.575, 0.825
+    fwd_x, fbk_x = 0.395, 0.705
+    rows = (0.76, 0.45, 0.14)
+    delays = (0.605, 0.295)
+    add_size = max(5.0, fontsize * 1.15)
+
+    ax.text(X(0.5), Y(0.99), title, ha="center", va="top", fontsize=fontsize,
+            color="#333")
+
+    # ---- the input bus, and the feed-forward branches off it
+    ax.annotate(in_label, (X(0.0), Y(rows[0])), textcoords="offset points",
+                xytext=(0, 0), ha="left", va="center", fontsize=fontsize)
+    _arrow(ax, X(0.13), Y(rows[0]), X(in_x), Y(rows[0]))
+    _line(ax, X(in_x), Y(rows[2]), X(in_x), Y(rows[0]))
+    for v in rows[1:]:
+        _node(ax, X(in_x), Y(v))
+    for v, gain, name in zip(rows, (b0, b1, b2), ("b0", "b1", "b2")):
+        dead = gain == 0.0
+        colour = _DEAD_COLOUR if dead else _WIRE
+        _arrow(ax, X(in_x), Y(v), X(add_x), Y(v), colour=colour, shrink_b=add_size / 2)
+        _gain(ax, X(fwd_x), Y(v), f"{name} = {gain:+.6g}", fontsize,
+              colour=_DEAD_COLOUR if dead else _GAIN_COLOUR)
+
+    # ---- the accumulator chain, running upward through the two delays
+    for v in rows:
+        _adder(ax, X(add_x), Y(v), add_size)
+    for v_from, v_to, v_delay in zip(rows[1:], rows[:-1], delays):
+        _arrow(ax, X(add_x), Y(v_from), X(add_x), Y(v_to),
+               shrink_a=add_size / 2, shrink_b=add_size / 2)
+        _delay(ax, X(add_x), Y(v_delay), fontsize)
+
+    # ---- the output bus, and the feedback branches off it
+    _arrow(ax, X(add_x), Y(rows[0]), X(0.99), Y(rows[0]), shrink_a=add_size / 2)
+    ax.annotate(out_label, (X(0.99), Y(rows[0])), textcoords="offset points",
+                xytext=(0, 7), ha="right", va="bottom", fontsize=fontsize)
+    _node(ax, X(out_x), Y(rows[0]))
+    _line(ax, X(out_x), Y(rows[2]), X(out_x), Y(rows[0]))
+    for v, gain, name in zip(rows[1:], (a1, a2), ("a1", "a2")):
+        dead = gain == 0.0
+        colour = _DEAD_COLOUR if dead else _WIRE
+        _node(ax, X(out_x), Y(v))
+        _arrow(ax, X(out_x), Y(v), X(add_x), Y(v), colour=colour,
+               shrink_b=add_size / 2)
+        _gain(ax, X(fbk_x), Y(v), f"−{name} = {-gain:+.6g}", fontsize, facing="left",
+              dy=-7, colour=_DEAD_COLOUR if dead else _GAIN_COLOUR)
+
+
+def _draw_cascade_strip(ax, n, y, fontsize):
+    """The section running order, along the top of the design view."""
+    xs = np.linspace(0.14, 0.86, n) if n > 1 else np.array([0.5])
+    ax.annotate("x[n]", (0.02, y), ha="left", va="center", fontsize=fontsize)
+    ax.annotate("y[n]", (0.98, y), ha="right", va="center", fontsize=fontsize)
+    step = (xs[1] - xs[0]) if n > 1 else 0.3
+    gap = min(0.025, 0.35 * step)          # clearance around each box
+    _arrow(ax, 0.062, y, xs[0] - gap, y)
+    _arrow(ax, xs[-1] + gap, y, 0.955, y)
+    for i, x in enumerate(xs):
+        ax.text(x, y, str(i), ha="center", va="center", fontsize=fontsize,
+                zorder=5,
+                bbox=dict(boxstyle="round,pad=0.34", fc="#eaf2fa", ec="#1f77b4",
+                          lw=0.9))
+        if i:
+            _arrow(ax, xs[i - 1] + gap, y, x - gap, y)
+
+
+def draw_iir_structure(ax, res):
+    """The whole IIR filter: a cascade of biquads, with the real coefficients."""
+    ax.clear()
+    ax.set_axis_off()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    sos = res.sos
+    n = len(sos)
+    cols = 1 if n <= 2 else 2 if n <= 8 else 3
+    rows = int(np.ceil(n / cols))
+    fontsize = float(np.clip(9.5 - 1.0 * rows, 4.5, 8.5))
+
+    ax.text(0.5, 0.995,
+            f"{_APPROX_NAMES[res.approximation]} {res.response}, order {res.order}"
+            f"  —  {n} biquad{'s' if n != 1 else ''} in cascade, "
+            "each transposed direct form II",
+            ha="center", va="top", fontsize=9)
+    _draw_cascade_strip(ax, n, 0.925, max(fontsize, 6.5))
+
+    top = 0.885
+    cw, ch = 1.0 / cols, top / rows
+    for i, s in enumerate(sos):
+        r, c = divmod(i, cols)
+        box = (c * cw + 0.012, top - (r + 1) * ch + 0.02 * ch,
+               cw - 0.024, ch * 0.94)
+        poles = np.roots(s[3:])
+        radius = float(np.max(np.abs(poles)))
+        freq = float(np.max(np.abs(np.angle(poles)))) * res.fs / (2.0 * np.pi)
+        _draw_biquad(
+            ax, s, box,
+            in_label="x[n]" if i == 0 else f"w{i}[n]",
+            out_label="y[n]" if i == n - 1 else f"w{i + 1}[n]",
+            title=f"section {i}   |p| = {radius:.4f}   f = {freq:.4g}",
+            fontsize=fontsize)
+
+
+def draw_fir_structure(ax, res, max_taps=13):
+    """The FIR filter as a tapped delay line.
+
+    A long filter cannot be drawn tap by tap and stay readable, so past
+    ``max_taps`` the middle is replaced by a break and the caption says exactly
+    which taps are missing from the picture.
+    """
+    ax.clear()
+    ax.set_axis_off()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    n = res.numtaps
+    if n <= max_taps:
+        cols, omitted = list(range(n)), None
+    else:
+        half = max_taps // 2
+        # ``None`` marks the column that stands in for the taps left out.
+        cols = list(range(half)) + [None] + list(range(n - half, n))
+        omitted = (half, n - half - 1)
+
+    fontsize = float(np.clip(90.0 / len(cols), 6.0, 9.0))
+    xs = np.linspace(0.085, 0.93, len(cols))
+    y_top, y_gain, y_sum = 0.87, 0.68, 0.12
+    add_size = max(6.0, fontsize * 1.3)
+
+    ax.text(0.5, 0.985,
+            f"Type {res.ftype} {res.symmetry} FIR, N = {res.numtaps}"
+            "  —  direct form: a tapped delay line into one accumulator",
+            ha="center", va="top", fontsize=9)
+    ax.annotate("x[n]", (0.005, y_top), ha="left", va="center", fontsize=fontsize)
+    ax.annotate("y[n]", (0.995, y_sum), ha="right", va="center", fontsize=fontsize)
+    _arrow(ax, 0.042, y_top, xs[0], y_top)
+
+    for i, (x, k) in enumerate(zip(xs, cols)):
+        if i:
+            _arrow(ax, xs[i - 1], y_top, x, y_top)
+            _arrow(ax, xs[i - 1], y_sum, x, y_sum,
+                   shrink_a=add_size / 2 if i > 1 else 0.0,
+                   shrink_b=add_size / 2 if k is not None else 0.0)
+            if cols[i - 1] is not None and k is not None:
+                _delay(ax, (xs[i - 1] + x) / 2, y_top, fontsize)
+        if k is None:                       # the break standing in for the rest
+            for y in (y_top, y_sum):
+                ax.text(x, y, "⋯", ha="center", va="center", zorder=5,
+                        fontsize=fontsize + 4, color=_WIRE,
+                        bbox=dict(boxstyle="square,pad=0.2", fc="white", ec="none"))
+            continue
+        _node(ax, x, y_top)
+        _arrow(ax, x, y_top, x, y_sum, shrink_b=add_size / 2 if i else 0.0)
+        _gain(ax, x, y_gain, "", fontsize, facing="down")
+        ax.annotate(f"h{k}", (x, y_gain), textcoords="offset points",
+                    xytext=(-7, 0), ha="right", va="center", fontsize=fontsize,
+                    color=_GAIN_COLOUR)
+        ax.annotate(f"{res.h[k]:+.6g}", (x, 0.5 * (y_gain + y_sum)),
+                    textcoords="offset points", xytext=(4, 0), rotation=90,
+                    ha="center", va="center", fontsize=fontsize - 0.5,
+                    color=_GAIN_COLOUR)
+        if i:
+            _adder(ax, x, y_sum, add_size)
+    _arrow(ax, xs[-1], y_sum, 0.958, y_sum, shrink_a=add_size / 2)
+
+    notes = []
+    if omitted is not None:
+        notes.append(f"taps {omitted[0]} … {omitted[1]} are not drawn")
+    sign = "h[n] = h[N−1−n]" if res.symmetry == "symmetric" else "h[n] = −h[N−1−n]"
+    notes.append(f"{sign}, so the folded form needs only {(n + 1) // 2} multipliers")
+    ax.text(0.5, 0.035, ";   ".join(notes), ha="center", va="center",
+            fontsize=8, color="#555")
 
 
 def main():
