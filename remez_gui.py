@@ -164,11 +164,10 @@ class BandRow:
 class Panel(ttk.Frame):
     """A titled box whose contents can be folded away.
 
-    Seven of these stacked up do not fit on a laptop screen, and a control that
-    is off the bottom of the window may as well not exist.  The button at the top
-    right of each one hides its contents, and gives up the panel's share of the
-    vertical space at the same time -- collapsing something has to leave the room
-    to somebody else, or nothing is gained.
+    Seven of these stacked up do not fit on a laptop screen.  The column they
+    live in scrolls, and the button at the top right of each one folds its
+    contents away, which is quicker than scrolling past something you are not
+    using.
 
     Put contents in ``.body``, not in the panel itself.
     """
@@ -176,14 +175,12 @@ class Panel(ttk.Frame):
     SHOWN = "–"            # en dash: click to fold away
     HIDDEN = "+"
 
-    def __init__(self, parent, title, row, weight=0, collapsed=False,
-                 on_toggle=None):
+    def __init__(self, parent, title, row, collapsed=False, on_toggle=None):
         super().__init__(parent, padding=(6, 2, 6, 6))
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
         self._parent = parent
         self._row = row
-        self._weight = weight
         self._on_toggle = on_toggle
         self.title = title
 
@@ -212,16 +209,9 @@ class Panel(ttk.Frame):
     def grid_into(self, **kw):
         """Grid the panel itself into the row it was told about."""
         kw.setdefault("column", 0)
-        kw.setdefault("sticky", "nsew")
+        kw.setdefault("sticky", "new")
         self.grid(row=self._row, **kw)
-        self._claim_space()
         return self
-
-    def _claim_space(self):
-        # A collapsed panel asks for no share of the leftover height, so the
-        # space it was using goes to whatever is still open.
-        self._parent.rowconfigure(
-            self._row, weight=0 if self.collapsed else self._weight)
 
     def _sync(self):
         self.button.configure(text=self.HIDDEN if self.collapsed else self.SHOWN)
@@ -235,7 +225,6 @@ class Panel(ttk.Frame):
             self._rule.grid()
             self.body.grid()
         self._sync()
-        self._claim_space()
 
     def toggle(self):
         self.collapse(not self.collapsed)
@@ -321,11 +310,64 @@ class RemezApp:
 
     # ---------------------------------------------------------------- controls
 
-    def _build_controls(self, parent):
-        """Mode selector, the two mode panels, and the shared bottom half."""
+    def _build_controls(self, outer):
+        """A scrollable column: the mode selector, the two mode panels, and the
+        shared panels below them, all stacked from the top.
+
+        Nothing here stretches to fill the height.  Panels that grow with the
+        window would have to take that space from somewhere, and what they took
+        it from was the panels below them -- which is why the lower ones used to
+        sit against the bottom of the pane.  Everything asks for the height it
+        needs, the column scrolls if that does not fit, and the one widget with
+        its own scrollbar (the report) is a fixed size.
+        """
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0,
+                           takefocus=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        self.scroll = ttk.Scrollbar(outer, orient="vertical",
+                                    command=canvas.yview)
+        self.scroll.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=self.scroll.set)
+        self.canvas_controls = canvas
+
+        # A right margin, so no panel's own scrollbar ends up flush against the
+        # one that scrolls the whole column.
+        parent = ttk.Frame(canvas, padding=(0, 0, 6, 0))
+        window = canvas.create_window((0, 0), window=parent, anchor="nw")
+        self.controls = parent
+
+        def fit_contents(_event=None):
+            # The canvas asks the paned window for the width the controls need;
+            # its own children do not contribute to that on their own.
+            need = parent.winfo_reqwidth()
+            canvas.configure(scrollregion=canvas.bbox("all"), width=need)
+            stretch(need)
+            self._place_sash()
+
+        def stretch(need):
+            # Fill the canvas when there is room to spare, but never squeeze the
+            # controls below the width they need: grid would answer by clipping
+            # the right-hand end of the band table.
+            canvas.itemconfigure(window,
+                                 width=max(canvas.winfo_width(), need))
+
+        def fill_width(event):
+            stretch(parent.winfo_reqwidth())
+
+        parent.bind("<Configure>", fit_contents)
+        canvas.bind("<Configure>", fill_width)
+        self._fit_controls = fit_contents
+
+        # Scroll only while the pointer is over the column, so the wheel still
+        # belongs to the plot when it is over the plot.
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>",
+                                                         self._wheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
-        parent.rowconfigure(5, weight=1)
 
         sel = ttk.Frame(parent)
         sel.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -339,7 +381,8 @@ class RemezApp:
         self.fir_panel = ttk.Frame(parent)
         self.iir_panel = ttk.Frame(parent)
         for panel in (self.fir_panel, self.iir_panel):
-            panel.grid(row=1, column=0, sticky="nsew")
+            panel.grid(row=1, column=0, sticky="new")
+            panel.columnconfigure(0, weight=1)
         self._build_fir_controls(self.fir_panel)
         self._build_iir_controls(self.iir_panel)
         self.iir_panel.grid_remove()
@@ -348,21 +391,33 @@ class RemezApp:
         self._build_actions(parent)
         self._build_display(parent)
         self._build_report(parent)
+        parent.after_idle(self._fit_controls)
 
-    def _panel(self, parent, title, row, weight=0, label=None, **grid):
+    def _wheel(self, event):
+        """One notch of the wheel, whichever platform's units it arrives in."""
+        delta = event.delta
+        if abs(delta) >= 120:                 # Windows and X11 report multiples
+            delta //= 120
+        try:
+            self.canvas_controls.yview_scroll(-int(delta), "units")
+        except tk.TclError:
+            pass
+
+    def _panel(self, parent, title, row, label=None, **grid):
         """Make a collapsible panel, register it under ``title``, and grid it.
 
         ``label`` overrides the heading, for the two panels whose headings would
         otherwise collide between the modes.
         """
-        panel = Panel(parent, label or title, row, weight=weight,
+        panel = Panel(parent, label or title, row,
                       on_toggle=self._panel_toggled)
         panel.grid_into(**grid)
         self.panels[title] = panel
         return panel
 
     def _panel_toggled(self, panel):
-        """Folding a panel changes how wide the controls want to be."""
+        """Folding changes how tall and how wide the column wants to be."""
+        self._fit_controls()
         self._place_sash()
 
     def _build_arithmetic(self, parent):
@@ -497,16 +552,20 @@ class RemezApp:
                 self.noise_check = w
 
     def _build_report(self, parent):
-        rbox = self._panel(parent, "Result", 5, weight=1, pady=(8, 0)).body
+        rbox = self._panel(parent, "Result", 5, pady=(8, 0)).body
         rbox.columnconfigure(0, weight=1)
-        rbox.rowconfigure(0, weight=1)
-        self.report = tk.Text(rbox, width=44, height=14, wrap="none",
+        # A fixed height: the report scrolls itself, so it has no reason to grow
+        # with the window, and growing is what pushed the panels apart.
+        self.report = tk.Text(rbox, width=44, height=16, wrap="none",
                               font=("Menlo", 10), relief="flat")
         self.report.grid(row=0, column=0, sticky="nsew")
         self.report.configure(state="disabled")
         sb = ttk.Scrollbar(rbox, orient="vertical", command=self.report.yview)
-        sb.grid(row=0, column=1, sticky="ns")
+        # Inset, so it reads as the report's own scrollbar rather than as part
+        # of the one scrolling the whole column.
+        sb.grid(row=0, column=1, sticky="ns", padx=(3, 4))
         self.report.configure(yscrollcommand=sb.set)
+        self.report_scroll = sb
 
     def _build_fir_controls(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -551,7 +610,7 @@ class RemezApp:
                  lambda e: (self.load_preset(self.preset.get()), self.design()))
 
         # --- constraint table --------------------------------------------
-        cbox = self._panel(parent, "Bands and constraints", 1, weight=1,
+        cbox = self._panel(parent, "Bands and constraints", 1,
                            pady=(8, 0)).body
         cbox.columnconfigure(0, weight=1)
 
@@ -622,7 +681,7 @@ class RemezApp:
                  lambda e: (self.load_iir_preset(self.iir_preset.get()), self.design()))
 
         # --- the specification --------------------------------------------
-        sbox = self._panel(parent, "Bands and specification", 1, weight=1,
+        sbox = self._panel(parent, "Bands and specification", 1,
                            pady=(8, 0)).body
         for c in (1, 2):
             sbox.columnconfigure(c, weight=1)

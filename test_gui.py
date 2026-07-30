@@ -793,15 +793,22 @@ def generate_sv(app, path, monkeypatch):
     return path.read_text() if path.exists() else ""
 
 
-def test_the_generate_sv_button_is_on_the_action_row(app):
-    labels = []
-    for child in app.root.winfo_children():
-        for frame in child.winfo_children():
-            for w in frame.winfo_children():
-                for b in w.winfo_children():
-                    if b.winfo_class() == "TButton":
-                        labels.append(b.cget("text"))
-    assert any("Generate SV" in str(t) for t in labels), labels
+def button_labels(widget):
+    """Every button label below a widget, at whatever depth it sits."""
+    out = []
+    for child in widget.winfo_children():
+        if child.winfo_class() == "TButton":
+            out.append(str(child.cget("text")))
+        out += button_labels(child)
+    return out
+
+
+def test_the_action_buttons_are_all_there(app):
+    labels = button_labels(app.root)
+    for wanted in ("Design", "Save plot", "Open design", "Save design",
+                   "Save coefficients", "Save C", "Generate SV",
+                   "Generate VHDL"):
+        assert any(wanted in t for t in labels), (wanted, labels)
 
 
 def test_headroom_and_fixed_coefficients_default_sensibly(app):
@@ -1197,37 +1204,117 @@ def test_the_control_is_at_the_top_right_of_the_panel(app):
         assert int(head.grid_info()["row"]) == 0, title
 
 
-def test_folding_a_panel_gives_its_space_to_the_others(app):
+def test_every_panel_stacks_from_the_top(app):
+    """No panel stretches, so none of them sit against the bottom of the pane.
+
+    A panel that grew with the window had to take that space from the panels
+    below it, which is what pushed the lower ones down to the bottom edge.
+    """
     root = app.root
-    root.deiconify()                     # geometry is only real once mapped
-    root.geometry("1360x700")            # a laptop, where they do not all fit
-    for _ in range(6):
-        root.update()
-    bands = app.panels["Bands and constraints"]
-    before = bands.winfo_height()
-
-    for name in ("Result", "Display", "Arithmetic"):
-        app.panels[name].toggle()
-    for _ in range(6):
+    root.deiconify()
+    root.geometry("1300x620")
+    for _ in range(12):
         root.update()
 
-    assert bands.winfo_height() > before
-    # A folded panel keeps only its header.
-    for name in ("Result", "Display", "Arithmetic"):
-        panel = app.panels[name]
-        assert panel.winfo_height() < 60
-        assert panel.button.grid_info() != {}      # the header stays
+    stacked = sorted((p for p in app.panels.values()
+                      if p.grid_info() and p.master is app.controls),
+                     key=lambda q: int(q.grid_info()["row"]))
+    tops = [p.winfo_y() for p in stacked]
+    assert tops == sorted(tops)                  # in row order, down the column
+
+    # None of them is taller than it asked to be, which is what stretching
+    # would look like.  (They are not adjacent: the action buttons sit between
+    # the Arithmetic and Display panels.)
+    for panel in app.panels.values():
+        if panel.grid_info():
+            assert panel.winfo_height() <= panel.winfo_reqheight() + 2, panel.title
+
+    # And no row is configured to soak up leftover height.
+    for panel in app.panels.values():
+        row = int(panel.grid_info()["row"])
+        assert int(panel.master.rowconfigure(row)["weight"]) == 0, panel.title
     root.withdraw()
 
 
-def test_a_folded_panel_claims_no_share_of_the_leftover_height(app):
-    parent = app.panels["Result"].master
-    row = app.panels["Result"].grid_info()["row"]
-    assert parent.rowconfigure(row)["weight"] in (1, "1")
-    app.panels["Result"].toggle()
-    assert parent.rowconfigure(row)["weight"] in (0, "0")
-    app.panels["Result"].toggle()
-    assert parent.rowconfigure(row)["weight"] in (1, "1")
+def test_the_column_scrolls_when_the_panels_do_not_fit(app):
+    root = app.root
+    root.deiconify()
+    root.geometry("1300x620")
+    for _ in range(14):
+        root.update()
+
+    canvas = app.canvas_controls
+    tall = int(canvas.cget("scrollregion").split()[3])
+    assert tall > canvas.winfo_height()           # more than fits
+    first, last = app.scroll.get()
+    assert (first, last) != (0.0, 1.0)            # so the bar has a thumb
+
+    app._wheel(type("E", (), {"delta": -3})())
+    for _ in range(4):
+        root.update()
+    assert app.scroll.get()[0] > first            # and the wheel moves it
+    root.withdraw()
+
+
+def test_folding_shortens_the_column_to_scroll(app):
+    root = app.root
+    root.deiconify()
+    root.geometry("1300x620")
+    for _ in range(12):
+        root.update()
+
+    def height():
+        return int(app.canvas_controls.cget("scrollregion").split()[3])
+
+    before = height()
+    app.panels["Arithmetic"].toggle()
+    for _ in range(10):
+        root.update()
+    assert height() < before - 100                # a whole panel's worth
+    app.panels["Arithmetic"].toggle()
+    for _ in range(10):
+        root.update()
+    assert height() == before
+    root.withdraw()
+
+
+def test_the_controls_are_never_squeezed_narrower_than_they_need(app):
+    """Grid answers a too-narrow column by clipping the right of the band table,
+    which is where the remove-band buttons are."""
+    root = app.root
+    root.deiconify()
+    root.geometry("1300x620")
+    for _ in range(16):
+        root.update()
+    assert app.controls.winfo_width() >= app.controls.winfo_reqwidth()
+    assert app.table.winfo_width() >= app.table.winfo_reqwidth()
+    for row in app.rows:
+        right = (row.remove.winfo_rootx() + row.remove.winfo_width()
+                 - app.table.winfo_rootx())
+        assert right <= app.table.winfo_width()
+    root.withdraw()
+
+
+def test_the_report_is_a_fixed_height_with_its_own_inset_scrollbar(app):
+    root = app.root
+    root.deiconify()
+    root.geometry("1300x620")
+    for _ in range(12):
+        root.update()
+    tall = app.report.winfo_height()
+
+    root.geometry("1300x1000")                # a much taller window
+    for _ in range(12):
+        root.update()
+    assert app.report.winfo_height() == tall   # unchanged: it scrolls itself
+
+    # Its scrollbar is inset, so it does not sit flush against the one that
+    # scrolls the whole column.
+    assert int(app.report_scroll.grid_info()["padx"][1]) > 0
+    inner_right = (app.report_scroll.winfo_rootx()
+                   + app.report_scroll.winfo_width())
+    assert inner_right < app.scroll.winfo_rootx(), "the scrollbars are touching"
+    root.withdraw()
 
 
 def test_folding_does_not_disturb_the_design(app):

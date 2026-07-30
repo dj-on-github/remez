@@ -17,6 +17,21 @@ The plot panel, here on the multiband FIR preset:
 
 ![the plot panel on a four-band design](docs/example-plot.png)
 
+## The control column
+
+All the controls live in one column on the left, stacked from the top and
+scrolling as a whole — seven panels do not fit on a laptop screen, and a field
+that is off the bottom of the window may as well not exist. Each panel has a
+`–` button at its top right that folds its contents away, which is quicker than
+scrolling past something you are not using; which panels are folded is saved
+with the design.
+
+Nothing in the column stretches to fill the height. A panel that grew with the
+window would have to take that space from the panels below it, which is what
+makes lower panels drift to the bottom edge. The report at the bottom scrolls
+itself, so it is a fixed height, and its scrollbar is inset from the one that
+scrolls the whole column.
+
 ## Running it
 
 ```bash
