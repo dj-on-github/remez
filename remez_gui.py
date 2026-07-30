@@ -20,15 +20,19 @@ from __future__ import annotations
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import json
 
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
+import datapath as dp
 import fir_core as rz
 import fixed_point as fp
 import iir_core as ii
+import rtl_common as rc
 import sv_export as sv
+import vhdl_export as vh
 
 MODE_FIR = "FIR — Remez exchange"
 MODE_IIR = "IIR — bilinear transform"
@@ -157,6 +161,88 @@ class BandRow:
         self.widgets[5].configure(state="normal" if use_spec else "disabled")
 
 
+class Panel(ttk.Frame):
+    """A titled box whose contents can be folded away.
+
+    Seven of these stacked up do not fit on a laptop screen, and a control that
+    is off the bottom of the window may as well not exist.  The button at the top
+    right of each one hides its contents, and gives up the panel's share of the
+    vertical space at the same time -- collapsing something has to leave the room
+    to somebody else, or nothing is gained.
+
+    Put contents in ``.body``, not in the panel itself.
+    """
+
+    SHOWN = "–"            # en dash: click to fold away
+    HIDDEN = "+"
+
+    def __init__(self, parent, title, row, weight=0, collapsed=False,
+                 on_toggle=None):
+        super().__init__(parent, padding=(6, 2, 6, 6))
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+        self._parent = parent
+        self._row = row
+        self._weight = weight
+        self._on_toggle = on_toggle
+        self.title = title
+
+        head = ttk.Frame(self)
+        head.grid(row=0, column=0, sticky="ew")
+        head.columnconfigure(0, weight=1)
+        ttk.Label(head, text=title, font=("", 0, "bold")).grid(
+            row=0, column=0, sticky="w")
+        self.button = ttk.Button(head, width=2, command=self.toggle,
+                                 style="Panel.TButton")
+        self.button.grid(row=0, column=1, sticky="e")
+
+        self._rule = ttk.Separator(self, orient="horizontal")
+        self._rule.grid(row=1, column=0, sticky="ew", pady=(3, 5))
+
+        self.body = ttk.Frame(self)
+        self.body.grid(row=2, column=0, sticky="nsew")
+        self.body.columnconfigure(0, weight=1)
+
+        self.collapsed = False
+        if collapsed:
+            self.collapse()
+        else:
+            self._sync()
+
+    def grid_into(self, **kw):
+        """Grid the panel itself into the row it was told about."""
+        kw.setdefault("column", 0)
+        kw.setdefault("sticky", "nsew")
+        self.grid(row=self._row, **kw)
+        self._claim_space()
+        return self
+
+    def _claim_space(self):
+        # A collapsed panel asks for no share of the leftover height, so the
+        # space it was using goes to whatever is still open.
+        self._parent.rowconfigure(
+            self._row, weight=0 if self.collapsed else self._weight)
+
+    def _sync(self):
+        self.button.configure(text=self.HIDDEN if self.collapsed else self.SHOWN)
+
+    def collapse(self, collapsed=True):
+        self.collapsed = bool(collapsed)
+        if self.collapsed:
+            self.body.grid_remove()
+            self._rule.grid_remove()
+        else:
+            self._rule.grid()
+            self.body.grid()
+        self._sync()
+        self._claim_space()
+
+    def toggle(self):
+        self.collapse(not self.collapsed)
+        if self._on_toggle is not None:
+            self._on_toggle(self)
+
+
 class RemezApp:
     def __init__(self, root):
         self.root = root
@@ -179,8 +265,23 @@ class RemezApp:
         self.frac_bits = tk.IntVar(value=15)
         self.headroom = tk.IntVar(value=2)
         self.fixed_coeffs = tk.BooleanVar(value=True)
+        self.structure = tk.StringVar(value="chain")
+        self.folded = tk.BooleanVar(value=False)
+        self.show_noise = tk.BooleanVar(value=False)
+        self.want_tb = tk.BooleanVar(value=True)
+        self.last_rtl_written = []
         self.fixed = None
         self.eff = None
+        self.min_bits = None            # smallest word length that meets the spec
+        self._min_bits_key = None
+        self._noise = None              # cached (freq, dB, rms) of the datapath
+
+        # Every collapsible panel, by title, so their state can be saved and
+        # restored with the rest of the design.
+        self.panels = {}
+
+        style = ttk.Style()
+        style.configure("Panel.TButton", padding=(1, 0))
 
         paned = ttk.PanedWindow(root, orient="horizontal")
         paned.pack(fill="both", expand=True)
@@ -248,10 +349,25 @@ class RemezApp:
         self._build_display(parent)
         self._build_report(parent)
 
+    def _panel(self, parent, title, row, weight=0, label=None, **grid):
+        """Make a collapsible panel, register it under ``title``, and grid it.
+
+        ``label`` overrides the heading, for the two panels whose headings would
+        otherwise collide between the modes.
+        """
+        panel = Panel(parent, label or title, row, weight=weight,
+                      on_toggle=self._panel_toggled)
+        panel.grid_into(**grid)
+        self.panels[title] = panel
+        return panel
+
+    def _panel_toggled(self, panel):
+        """Folding a panel changes how wide the controls want to be."""
+        self._place_sash()
+
     def _build_arithmetic(self, parent):
         """Floating point, or a fixed-point word length to quantize onto."""
-        box = ttk.LabelFrame(parent, text="Arithmetic", padding=6)
-        box.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        box = self._panel(parent, "Arithmetic", 2, pady=(8, 0)).body
         box.columnconfigure(4, weight=1)
 
         ttk.Radiobutton(box, text="Floating point (double)", value=ARITH_FLOAT,
@@ -299,19 +415,47 @@ class RemezApp:
         c.grid(row=5, column=0, columnspan=5, sticky="w", pady=(2, 0))
         self.fixed_widgets.append(c)
 
+        # The structure is what trades combinational depth against area: a
+        # chain is smallest and slowest, a tree is deeper in registers but
+        # shorter in logic, and a MAC is one multiplier at one term per clock.
+        ttk.Label(box, text="structure").grid(row=6, column=0, sticky="w",
+                                              pady=(4, 0))
+        st = ttk.Combobox(box, textvariable=self.structure, state="readonly",
+                          width=22, values=list(dp.STRUCTURES))
+        st.grid(row=6, column=1, columnspan=4, sticky="ew", padx=2, pady=(4, 0))
+        st.bind("<<ComboboxSelected>>", self._arith_changed)
+        self.fixed_widgets.append(st)
+        self.structure_combo = st
+
+        c = ttk.Checkbutton(box, text="fold the symmetry (half the multipliers)",
+                            variable=self.folded, command=self._arith_changed)
+        c.grid(row=7, column=0, columnspan=5, sticky="w")
+        self.fixed_widgets.append(c)
+        self.fold_check = c
+
+        c = ttk.Checkbutton(box, text="write a self-checking testbench beside it",
+                            variable=self.want_tb)
+        c.grid(row=8, column=0, columnspan=5, sticky="w")
+        self.fixed_widgets.append(c)
+
         self.arith_status = tk.StringVar(value="")
         ttk.Label(box, textvariable=self.arith_status, foreground="#555",
-                  justify="left").grid(row=6, column=0, columnspan=5, sticky="w",
+                  justify="left").grid(row=9, column=0, columnspan=5, sticky="w",
                                        pady=(4, 0))
         self._sync_arith_widgets()
 
     def _sync_arith_widgets(self):
-        """Grey out the word-length controls unless fixed point is selected."""
+        """Grey out what does not apply: the word length, or the FIR structures."""
         fixed = self.is_fixed()
         for w in self.fixed_widgets:
             w.configure(state="normal" if fixed else "disabled")
         if fixed and self.auto_frac.get():
             self.frac_spin.configure(state="disabled")
+        if self.is_iir():
+            # A biquad cascade has nothing to fold and cannot be pipelined
+            # through its own feedback.
+            self.structure_combo.configure(state="disabled")
+            self.fold_check.configure(state="disabled")
 
     def _build_actions(self, parent):
         # Two rows: one wide row of five buttons would set the width of the
@@ -322,32 +466,38 @@ class RemezApp:
             act.columnconfigure(column, weight=1)
         buttons = [("Design  (Ctrl+Enter)", self.design, 0, 0, 2),
                    ("Save plot…", self.save_plot, 0, 2, 1),
-                   ("Save coefficients…", self.save_coefficients, 1, 0, 1),
-                   ("Save C…", self.save_c_source, 1, 1, 1),
-                   ("Generate SV…", self.save_sv_source, 1, 2, 1)]
+                   ("Open design…", self.open_design, 1, 0, 1),
+                   ("Save design…", self.save_design, 1, 1, 1),
+                   ("Save coefficients…", self.save_coefficients, 1, 2, 1),
+                   ("Save C…", self.save_c_source, 2, 0, 1),
+                   ("Generate SV…", self.save_sv_source, 2, 1, 1),
+                   ("Generate VHDL…", self.save_vhdl_source, 2, 2, 1)]
         for text, command, row, column, span in buttons:
             ttk.Button(act, text=text, command=command).grid(
                 row=row, column=column, columnspan=span, sticky="ew",
                 padx=(0, 3), pady=(0, 3))
 
     def _build_display(self, parent):
-        opt = ttk.LabelFrame(parent, text="Display", padding=6)
-        opt.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        opt = self._panel(parent, "Display", 4, pady=(8, 0)).body
         self.log_scale = tk.BooleanVar(value=True)
         self.show_spec = tk.BooleanVar(value=True)
         self.show_ext = tk.BooleanVar(value=True)
         for i, (text, var) in enumerate([
                 ("Magnitude in dB", self.log_scale),
                 ("Show constraints", self.show_spec),
-                ("Show extremal frequencies", self.show_ext)]):
-            w = ttk.Checkbutton(opt, text=text, variable=var, command=self.redraw)
+                ("Show extremal frequencies", self.show_ext),
+                ("Measure the fixed-point noise floor", self.show_noise)]):
+            command = (self._noise_toggled if var is self.show_noise
+                       else self.redraw)
+            w = ttk.Checkbutton(opt, text=text, variable=var, command=command)
             w.grid(row=i, column=0, sticky="w")
             if var is self.show_ext:
                 self.ext_check = w          # FIR only; greyed out in IIR mode
+            if var is self.show_noise:
+                self.noise_check = w
 
     def _build_report(self, parent):
-        rbox = ttk.LabelFrame(parent, text="Result", padding=6)
-        rbox.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
+        rbox = self._panel(parent, "Result", 5, weight=1, pady=(8, 0)).body
         rbox.columnconfigure(0, weight=1)
         rbox.rowconfigure(0, weight=1)
         self.report = tk.Text(rbox, width=44, height=14, wrap="none",
@@ -362,8 +512,7 @@ class RemezApp:
         parent.columnconfigure(0, weight=1)
 
         # --- filter parameters -------------------------------------------
-        box = ttk.LabelFrame(parent, text="Filter", padding=6)
-        box.grid(row=0, column=0, sticky="ew")
+        box = self._panel(parent, "Filter", 0).body
         for c in (1, 3):
             box.columnconfigure(c, weight=1)
 
@@ -402,9 +551,8 @@ class RemezApp:
                  lambda e: (self.load_preset(self.preset.get()), self.design()))
 
         # --- constraint table --------------------------------------------
-        cbox = ttk.LabelFrame(parent, text="Bands and constraints", padding=6)
-        cbox.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
-        parent.rowconfigure(1, weight=1)
+        cbox = self._panel(parent, "Bands and constraints", 1, weight=1,
+                           pady=(8, 0)).body
         cbox.columnconfigure(0, weight=1)
 
         self.table = ttk.Frame(cbox)
@@ -435,8 +583,7 @@ class RemezApp:
         self.iir_preset = tk.StringVar(value="Elliptic lowpass")
 
         # --- filter parameters -------------------------------------------
-        box = ttk.LabelFrame(parent, text="Filter", padding=6)
-        box.grid(row=0, column=0, sticky="ew")
+        box = self._panel(parent, "Filter (IIR)", 0, label="Filter").body
         box.columnconfigure(1, weight=1)
         box.columnconfigure(3, weight=1)
 
@@ -475,8 +622,8 @@ class RemezApp:
                  lambda e: (self.load_iir_preset(self.iir_preset.get()), self.design()))
 
         # --- the specification --------------------------------------------
-        sbox = ttk.LabelFrame(parent, text="Bands and specification", padding=6)
-        sbox.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        sbox = self._panel(parent, "Bands and specification", 1, weight=1,
+                           pady=(8, 0)).body
         for c in (1, 2):
             sbox.columnconfigure(c, weight=1)
 
@@ -767,14 +914,119 @@ class RemezApp:
             headroom = max(int(self.headroom.get()), 0)
         except tk.TclError:
             headroom = 0
+        smallest = self._smallest_word_length()
+        note = (f"{smallest} bits is the narrowest that meets the spec"
+                if smallest else "no word length up to 32 bits meets the spec")
+        try:
+            plan = rc.plan_for("iir" if self.is_iir() else "fir",
+                               self.eff, q, self.rtl_options())
+            cost = (f"{plan.resources['multipliers']} mult, "
+                    f"{plan.resources['adders']} add, "
+                    f"latency {plan.latency}")
+        except rc.RtlError as exc:
+            cost = str(exc).split(";")[0][:48]
         self.arith_status.set(
             f"{q.qformat}   step {q.step:.3g}   "
             f"range [{lo * q.step:g}, {hi * q.step:g}]\n"
             f"largest coefficient error {q.max_error:.3g}\n"
             f"RTL datapath {q.bits + headroom} bits "
             f"(Q{q.int_bits + headroom}.{q.frac_bits}), coefficients "
-            + ("built in" if self.fixed_coeffs.get() else "on a port")
+            + ("built in" if self.fixed_coeffs.get() else "on a port") + "\n"
+            + cost + "\n" + note
             + (f"\n***  {q.saturated} saturated  ***" if q.saturated else ""))
+
+    def rtl_options(self, name="filt"):
+        """The hardware options, as the back-ends want them."""
+        return sv.RtlOptions(
+            name=name,
+            headroom=int(self.headroom.get()),
+            fixed_coeffs=bool(self.fixed_coeffs.get()),
+            structure="chain" if self.is_iir() else self.structure.get(),
+            folded=False if self.is_iir() else bool(self.folded.get()))
+
+    def _smallest_word_length(self):
+        """The narrowest coefficient word that still meets the specification.
+
+        Answers the question the word-length spinbox otherwise gets walked up and
+        down to answer.  Against the dB specs when they are being used, and
+        otherwise against the design's own deviation, allowing the quantized
+        filter a quarter of a dB of slack on it.
+        """
+        res = self.iir_result if self.is_iir() else self.result
+        if res is None:
+            return None
+        key = (id(res), self.is_iir(), tuple(self.spec_dev or ()),
+               None if self.auto_frac.get() else int(self.frac_bits.get()))
+        if key == self._min_bits_key:
+            return self.min_bits
+
+        frac = None if self.auto_frac.get() else int(self.frac_bits.get())
+        if self.is_iir():
+            def meets(bits):
+                q = fp.quantize_sos(res.sos, bits, frac)
+                if q.saturated:
+                    return False
+                eff = ii.with_sos(res, q.values)
+                return bool(eff.stable and eff.meets_spec)
+        else:
+            slack = 10.0 ** (0.25 / 20.0)          # a quarter of a dB
+            want = (list(self.spec_dev) if self.spec_dev is not None
+                    else [d * slack for d in res.band_deviation])
+
+            def meets(bits):
+                q = fp.quantize(res.h, bits, frac)
+                if q.saturated:
+                    return False
+                eff = rz.with_taps(res, q.values)
+                return all(got <= limit * 1.0001
+                           for got, limit in zip(eff.band_deviation, want))
+
+        found = None
+        for bits in range(fp.MIN_BITS, 33):
+            try:
+                if meets(bits):
+                    found = bits
+                    break
+            except (fp.FixedPointError, rz.RemezError, ii.IIRError, ValueError):
+                continue
+        self._min_bits_key = key
+        self.min_bits = found
+        return found
+
+    def _noise_floor(self):
+        """Measure what the fixed-point datapath adds, cached per configuration."""
+        if self.fixed is None or self.eff is None:
+            return None
+        q = self.fixed
+        opts = self.rtl_options()
+        key = (id(self.eff), q.bits, q.frac_bits, opts.headroom, opts.structure,
+               opts.folded, self.is_iir())
+        if self._noise is not None and self._noise[0] == key:
+            return self._noise[1]
+
+        try:
+            if self.is_iir():
+                live = [0, 1, 2, 4, 5]
+                coeffs = [[int(row[i]) for i in live] for row in q.ints]
+                sos = self.eff.sos
+
+                def exact(x):
+                    return ii.sos_filter(sos, x)
+                measured = dp.noise_response(
+                    "iir", coeffs, exact, q.frac_bits, q.bits, opts.headroom)
+            else:
+                taps = self.eff.h
+
+                def exact(x):
+                    return np.convolve(x, taps)[:len(x)]
+                measured = dp.noise_response(
+                    "fir", q.ints, exact, q.frac_bits, q.bits, opts.headroom,
+                    structure=opts.structure, folded=opts.folded,
+                    symmetry=self.eff.symmetry)
+        except (dp.DatapathError, ValueError):
+            return None
+        self._noise = (key, measured)
+        return measured
 
     def _arith_changed(self, *_):
         """An arithmetic control moved: requantize, but do not redesign."""
@@ -882,6 +1134,8 @@ class RemezApp:
                 label=f"{self.fixed.bits}-bit coefficients" if quantized
                 else "designed response")
 
+        if quantized and self.show_noise.get() and log:
+            self._draw_noise(ax, res)
         if self.show_spec.get():
             self._draw_constraints(ax, res, log)
         if self.show_ext.get():
@@ -980,6 +1234,37 @@ class RemezApp:
         # its target.
         return f, des, abs(res.delta) / w
 
+    def _noise_toggled(self):
+        """The measurement shows up in the report as well as on the plot."""
+        self.redraw()
+        if (self.result if not self.is_iir() else self.iir_result) is not None:
+            self._report()
+
+    def _draw_noise(self, ax, res):
+        """The measured arithmetic noise, and the response once it is included.
+
+        The coefficient-quantized curve is what exact arithmetic would give.
+        Real hardware rounds every product, and that noise is uncorrelated with
+        the signal, so it adds in power: a stopband below the floor is simply not
+        there to be measured.  Both are drawn, since the gap between them is the
+        thing worth seeing.
+        """
+        measured = self._noise_floor()
+        if measured is None:
+            return
+        norm, noise_db, _ = measured
+        f = norm * res.fs
+        if self.is_iir():
+            mag_db = db(np.abs(self.eff.response_at(f)))
+        else:
+            mag_db = db(rz.amplitude_response(self.eff.h, 2 * np.pi * norm,
+                                              self.eff.symmetry))
+        ax.plot(f, noise_db, lw=0.9, color="#9467bd", ls=":", zorder=4,
+                label=f"arithmetic noise ({dp.NOISE_LEVEL:g} FS input)")
+        ax.plot(f, dp.effective_response(mag_db, noise_db), lw=1.0,
+                color="#8c564b", alpha=0.85, zorder=4,
+                label="as measured, noise included")
+
     def _draw_constraints(self, ax, res, log):
         """Desired response plus the achieved and requested tolerance bands."""
         first = True
@@ -1075,6 +1360,8 @@ class RemezApp:
         ax.plot(f, db(mag) if log else mag, lw=1.2, color="#1f77b4", zorder=3,
                 label=f"{self.fixed.bits}-bit coefficients" if quantized
                 else "designed response")
+        if quantized and self.show_noise.get() and log:
+            self._draw_noise(ax, res)
         if self.show_spec.get():
             self._draw_iir_mask(ax, res, log)
         ax.set_xlim(0, nyq)
@@ -1451,7 +1738,30 @@ class RemezApp:
             out.append(f"  *** {q.saturated} coefficient"
                        f"{'s' if q.saturated != 1 else ''} saturated: the binary "
                        "point is too far left ***")
-        out.append("  (coefficients only; datapath rounding is not modelled)")
+        smallest = self._smallest_word_length()
+        if smallest:
+            verdict = ("which is what this is"
+                       if smallest == q.bits else
+                       ("so this is wider than it needs to be"
+                        if smallest < q.bits else "so this is too narrow"))
+            out.append(f"  narrowest that meets the spec: {smallest} bits, "
+                       f"{verdict}")
+        else:
+            out.append("  no word length up to 32 bits meets the spec")
+
+        measured = self._noise_floor() if self.show_noise.get() else None
+        if measured is not None:
+            _, noise_db, rms = measured
+            out.append(f"  arithmetic noise {float(np.median(noise_db)):.1f} dB "
+                       f"below a {dp.NOISE_LEVEL:g} full-scale input")
+            out.append(f"  ({rms:.2f} LSB rms at the output, from rounding each")
+            out.append("   product; tick the display option to plot it)")
+        elif self.show_noise.get():
+            out.append("  the datapath could not be measured (see the design")
+            out.append("  warning above)")
+        else:
+            out.append("  the plots show coefficient quantization only; tick the")
+            out.append("  display option to measure the datapath as well")
         return out
 
     def _suggest_taps(self, res):
@@ -1566,8 +1876,15 @@ class RemezApp:
             lines.append(row)
         return lines
 
-    def save_sv_source(self):
-        """Write the filter out as synthesisable SystemVerilog."""
+    def save_vhdl_source(self):
+        """Write the filter out as synthesisable VHDL."""
+        self._save_rtl(vh, "Generate VHDL", ".vhd",
+                       [("VHDL", "*.vhd"), ("VHDL", "*.vhdl"),
+                        ("All files", "*")])
+
+    def _save_rtl(self, backend, title, suffix, filetypes):
+        """Shared by both back-ends: ask for a file, write the design and its
+        testbench beside it."""
         res = self.eff if self.eff is not None else (
             self.iir_result if self.is_iir() else self.result)
         if res is None:
@@ -1575,33 +1892,196 @@ class RemezApp:
         if self.fixed is None:
             messagebox.showerror(
                 "Nothing to generate",
-                "RTL needs fixed-point coefficients.\n\n"
+                "Hardware needs fixed-point coefficients.\n\n"
                 "Choose Fixed point in the Arithmetic panel, pick a word "
                 "length, and try again.")
             return
-        path = filedialog.asksaveasfilename(
-            title="Generate SystemVerilog",
-            defaultextension=".sv",
-            filetypes=[("SystemVerilog", "*.sv"), ("Verilog", "*.v"),
-                       ("All files", "*")])
+        path = filedialog.asksaveasfilename(title=title, defaultextension=suffix,
+                                            filetypes=filetypes)
         if not path:
             return
 
         stem = os.path.splitext(os.path.basename(path))[0]
+        kind = "iir" if self.is_iir() else "fir"
+        opts = self.rtl_options(stem)
         try:
-            opts = sv.SvOptions(name=stem,
-                                headroom=int(self.headroom.get()),
-                                fixed_coeffs=bool(self.fixed_coeffs.get()))
-            source = sv.source_for("iir" if self.is_iir() else "fir",
-                                   res, self.fixed, opts)
+            design = backend.source_for(kind, res, self.fixed, opts)
+            bench = (backend.testbench_for(kind, res, self.fixed, opts)
+                     if self.want_tb.get() else None)
         except (sv.SvError, ValueError, tk.TclError) as exc:
             messagebox.showerror("Cannot generate RTL", str(exc))
             return
+
+        written = [path]
         try:
             with open(path, "w") as fh:
-                fh.write(source)
+                fh.write(design)
+            if bench is not None:
+                root, ext = os.path.splitext(path)
+                tb_path = f"{root}_tb{ext}"
+                with open(tb_path, "w") as fh:
+                    fh.write(bench)
+                written.append(tb_path)
         except OSError as exc:
             messagebox.showerror("Save failed", str(exc))
+            return
+        self.last_rtl_written = written
+
+    def save_sv_source(self):
+        """Write the filter out as synthesisable SystemVerilog."""
+        self._save_rtl(sv, "Generate SystemVerilog", ".sv",
+                       [("SystemVerilog", "*.sv"), ("Verilog", "*.v"),
+                        ("All files", "*")])
+
+    # ------------------------------------------------------------------- design
+
+    def save_design(self):
+        """Write the whole specification out as JSON, so it can be reopened."""
+        path = filedialog.asksaveasfilename(
+            title="Save design", defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All files", "*")])
+        if not path:
+            return
+        try:
+            with open(path, "w") as fh:
+                json.dump(self.to_dict(), fh, indent=2, sort_keys=True)
+                fh.write("\n")
+        except (OSError, TypeError) as exc:
+            messagebox.showerror("Save failed", str(exc))
+
+    def open_design(self):
+        """Read a design back and put every control where it was."""
+        path = filedialog.askopenfilename(
+            title="Open design",
+            filetypes=[("JSON", "*.json"), ("All files", "*")])
+        if not path:
+            return
+        try:
+            with open(path) as fh:
+                state = json.load(fh)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Cannot open that file", str(exc))
+            return
+        try:
+            self.from_dict(state)
+        except (KeyError, TypeError, ValueError, tk.TclError) as exc:
+            messagebox.showerror("Cannot load that design",
+                                 f"{exc}\n\nThe file may be from another tool.")
+
+    def to_dict(self):
+        """Everything needed to rebuild this design, as plain data."""
+        return {
+            "format": "remez-filter-design",
+            "version": 1,
+            "mode": self.mode.get(),
+            "fs": float(self.fs.get()),
+            "fir": {
+                "numtaps": int(self.numtaps.get()),
+                "symmetry": self.symmetry.get(),
+                "grid_density": int(self.grid_density.get()),
+                "maxiter": int(self.maxiter.get()),
+                "use_spec": bool(self.use_spec.get()),
+                "bands": [row.read() for row in self.rows],
+            },
+            "iir": {
+                "response": self.response.get(),
+                "approximation": self.approximation.get(),
+                "order": int(self.iir_order.get()),
+                "auto_order": bool(self.auto_order.get()),
+                "wp": [v.get() for v in self.iir_wp],
+                "ws": [v.get() for v in self.iir_ws],
+                "rp": self.iir_rp.get(),
+                "rs": self.iir_rs.get(),
+            },
+            "arithmetic": {
+                "kind": self.arith.get(),
+                "word_bits": int(self.word_bits.get()),
+                "auto_frac": bool(self.auto_frac.get()),
+                "frac_bits": int(self.frac_bits.get()),
+                "headroom": int(self.headroom.get()),
+                "fixed_coeffs": bool(self.fixed_coeffs.get()),
+                "structure": self.structure.get(),
+                "folded": bool(self.folded.get()),
+                "testbench": bool(self.want_tb.get()),
+            },
+            "display": {
+                "log_scale": bool(self.log_scale.get()),
+                "show_spec": bool(self.show_spec.get()),
+                "show_ext": bool(self.show_ext.get()),
+                "show_noise": bool(self.show_noise.get()),
+                "view": self.view.get(),
+                "folded_panels": sorted(t for t, p in self.panels.items()
+                                       if p.collapsed),
+            },
+        }
+
+    def from_dict(self, state):
+        """Restore what :meth:`to_dict` wrote.  Anything absent keeps its value."""
+        if state.get("format") != "remez-filter-design":
+            raise ValueError("not a filter design file")
+
+        self.fs.set(float(state.get("fs", self.fs.get())))
+
+        fir = state.get("fir", {})
+        if "numtaps" in fir:
+            self.numtaps.set(int(fir["numtaps"]))
+        for key, var in (("symmetry", self.symmetry),
+                         ("grid_density", self.grid_density),
+                         ("maxiter", self.maxiter),
+                         ("use_spec", self.use_spec)):
+            if key in fir:
+                var.set(fir[key])
+        if fir.get("bands"):
+            self.clear_rows()
+            for values in fir["bands"]:
+                self.add_row(tuple(values))
+
+        iir = state.get("iir", {})
+        for key, var in (("response", self.response),
+                         ("approximation", self.approximation),
+                         ("order", self.iir_order),
+                         ("auto_order", self.auto_order),
+                         ("rp", self.iir_rp), ("rs", self.iir_rs)):
+            if key in iir:
+                var.set(iir[key])
+        for key, holder in (("wp", self.iir_wp), ("ws", self.iir_ws)):
+            for var, value in zip(holder, iir.get(key, [])):
+                var.set(value)
+
+        arith = state.get("arithmetic", {})
+        for key, var in (("kind", self.arith), ("word_bits", self.word_bits),
+                         ("auto_frac", self.auto_frac),
+                         ("frac_bits", self.frac_bits),
+                         ("headroom", self.headroom),
+                         ("fixed_coeffs", self.fixed_coeffs),
+                         ("structure", self.structure), ("folded", self.folded),
+                         ("testbench", self.want_tb)):
+            if key in arith:
+                var.set(arith[key])
+
+        display = state.get("display", {})
+        if "folded_panels" in display:
+            wanted = set(display["folded_panels"])
+            for title, panel in self.panels.items():
+                panel.collapse(title in wanted)
+        for key, var in (("log_scale", self.log_scale),
+                         ("show_spec", self.show_spec),
+                         ("show_ext", self.show_ext),
+                         ("show_noise", self.show_noise),
+                         ("view", self.view)):
+            if key in display:
+                var.set(display[key])
+
+        if "mode" in state and state["mode"] in MODES:
+            self.mode.set(state["mode"])
+        # One rebuild at the end, rather than one per field.
+        for row in self.rows:
+            row.set_spec_state(self.use_spec.get())
+        self._edge_fields_for_response()
+        self._auto_order_toggled(design=False)
+        self.switch_mode()
+        self._layout_axes()
+        self.switch_view()
 
     def save_c_source(self):
         # The generated filter runs in double precision, but it must run the

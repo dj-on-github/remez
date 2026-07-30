@@ -117,8 +117,8 @@ def run_rtl(tmp_path, source, top, stim, wcoef, headroom, coeffs=None):
     (tmp_path / "tb.sv").write_text(tb)
 
     build = subprocess.run(
-        [VERILATOR, "--binary", "--timing", "-o", "sim", "--Mdir",
-         str(tmp_path / "obj"), str(design), str(tmp_path / "tb.sv")],
+        [VERILATOR, "--binary", "--timing", "--top-module", "tb", "-o", "sim",
+         "--Mdir", str(tmp_path / "obj"), str(design), str(tmp_path / "tb.sv")],
         capture_output=True, text=True, cwd=tmp_path)
     assert build.returncode == 0, build.stdout + build.stderr
 
@@ -179,9 +179,9 @@ def test_fixed_coefficients_are_parameters_and_have_no_port():
 def test_runtime_coefficients_add_an_input_vector():
     res, q = fir_design()
     src = sv.fir_source(res, q, sv.SvOptions(name="lp", fixed_coeffs=False))
-    assert "input  wire signed [NTAPS*WCOEF-1:0] coeff," in src
+    assert "input  wire signed [NCOEF*WCOEF-1:0] coeff," in src
     assert ".FIXED(1'b0)" in src
-    assert ".coef(coeff[k*WCOEF +: WCOEF])" in src
+    assert ".coef(coeff[(k)*WCOEF +: WCOEF])" in src
     assert "h[0]" in src and f"h[{len(q.ints) - 1}]" in src   # the slice map
 
 
@@ -301,6 +301,48 @@ def test_the_rtl_lints_without_a_warning(tmp_path, kind, fixed_coeffs):
 # --------------------------------------------------------------------------
 # simulation
 # --------------------------------------------------------------------------
+
+@needs_verilator
+@pytest.mark.parametrize("folded", [False, True])
+@pytest.mark.parametrize("structure", ["chain", "tree", "mac"])
+def test_every_structure_lints_and_matches_the_model(tmp_path, structure, folded):
+    """Each structure computes the same filter, in its own arrangement.
+
+    The design and its generated testbench are compiled together and run: the
+    testbench carries the expected output of every sample, from the shared
+    model, so a pass means the RTL and the model agree exactly.
+    """
+    import rtl_common as rc
+    res, q = fir_design(numtaps=15, bits=12)
+    opts = sv.SvOptions(name="dut", headroom=3, structure=structure,
+                        folded=folded)
+    design = tmp_path / "dut.sv"
+    bench = tmp_path / "dut_tb.sv"
+    design.write_text(sv.source_for("fir", res, q, opts))
+    bench.write_text(sv.testbench_for("fir", res, q, opts))
+
+    lint = subprocess.run([VERILATOR, "--lint-only", "-Wall",
+                           "--top-module", "dut_tb",
+                           str(design), str(bench)],
+                          capture_output=True, text=True)
+    assert lint.returncode == 0, lint.stdout + lint.stderr
+
+    build = subprocess.run([VERILATOR, "--binary", "--timing",
+                            "--top-module", "dut_tb", "-o", "sim",
+                            "--Mdir", str(tmp_path / "obj"),
+                            str(design), str(bench)],
+                           capture_output=True, text=True, cwd=tmp_path)
+    assert build.returncode == 0, build.stdout + build.stderr
+    run = subprocess.run([str(tmp_path / "obj" / "sim")], capture_output=True,
+                         text=True, cwd=tmp_path)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "PASS" in run.stdout, run.stdout
+
+    # And folding really did halve the multipliers.
+    plan = rc.plan_for("fir", res, q, opts)
+    if structure != "mac":
+        assert plan.resources["multipliers"] == (8 if folded else 15)
+
 
 @needs_verilator
 def test_the_fir_rtl_matches_the_model_bit_for_bit(tmp_path):

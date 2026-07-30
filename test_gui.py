@@ -630,7 +630,7 @@ def test_the_report_shows_what_rounding_cost(app):
     text = report_text(app)
     assert "cost of rounding, per band" in text
     assert "as built, after rounding the taps" in text
-    assert "datapath rounding is not modelled" in text
+    assert "narrowest that meets the spec" in text
     # The coefficient listing gains the integers actually stored.
     assert str(int(app.fixed.ints[0])) in text
 
@@ -866,7 +866,7 @@ def test_the_checkbox_switches_the_coefficient_port(app, tmp_path, monkeypatch):
     app.fixed_coeffs.set(False)
     app._arith_changed()
     ported = generate_sv(app, tmp_path / "b.sv", monkeypatch)
-    assert "input  wire signed [NTAPS*WCOEF-1:0] coeff," in ported
+    assert "input  wire signed [NCOEF*WCOEF-1:0] coeff," in ported
     assert ".FIXED(1'b0)" in ported
 
 
@@ -923,3 +923,354 @@ def test_the_generated_rtl_lints_and_runs_the_designed_filter(app, tmp_path,
     impulse = [1 << frac] + [0] * app.result.numtaps
     taps = test_sv.run_rtl(tmp_path, src, "dut", impulse, app.fixed.bits, 3)
     assert taps[:app.result.numtaps] == [int(v) for v in app.fixed.ints]
+
+
+# ------------------------------------------- structures, VHDL, noise and JSON
+
+
+def test_the_structure_and_folding_controls_reach_the_rtl(app, tmp_path,
+                                                          monkeypatch):
+    go_fixed(app, 12)
+    for structure in ("chain", "tree", "mac"):
+        for folded in (False, True):
+            app.structure.set(structure)
+            app.folded.set(folded)
+            app._arith_changed()
+            src = generate_sv(app, tmp_path / f"{structure}{int(folded)}.sv",
+                              monkeypatch)
+            assert f"parameter int NTERM    = {app.eff.numtaps // 2 + 1}," in src \
+                if folded else True
+            if structure == "tree":
+                assert "function automatic int level_count" in src
+            if structure == "mac":
+                assert "logic signed [WDATA-1:0] mem [0:NTAPS-1];" in src
+            if folded:
+                assert "_addw" in src
+            else:
+                assert "_addw" not in src
+
+
+def test_folding_halves_the_multipliers_in_the_status_line(app):
+    go_fixed(app, 12)
+    app.folded.set(False)
+    app._arith_changed()
+    flat = app.arith_status.get()
+    app.folded.set(True)
+    app._arith_changed()
+    folded = app.arith_status.get()
+    n = app.result.numtaps
+    assert f"{n} mult" in flat
+    assert f"{n // 2 + 1} mult" in folded
+
+
+def test_the_structure_changes_the_reported_latency(app):
+    go_fixed(app, 12)
+    app.structure.set("chain")
+    app._arith_changed()
+    assert "latency 1" in app.arith_status.get()
+    app.structure.set("mac")
+    app._arith_changed()
+    assert "latency 1" not in app.arith_status.get()
+
+
+def test_the_iir_has_no_structure_choice(iir):
+    go_fixed(iir, 16)
+    assert str(iir.structure_combo["state"]) == "disabled"
+    assert str(iir.fold_check["state"]) == "disabled"
+    opts = iir.rtl_options()
+    assert opts.structure == "chain" and opts.folded is False
+
+
+def test_a_testbench_is_written_beside_the_design(app, tmp_path, monkeypatch):
+    go_fixed(app, 12)
+    assert app.want_tb.get() is True
+    generate_sv(app, tmp_path / "dut.sv", monkeypatch)
+    tb = tmp_path / "dut_tb.sv"
+    assert tb.exists()
+    text = tb.read_text()
+    assert "module dut_tb;" in text
+    assert "EXPECT" in text and "PASS" in text
+    # and it can be turned off
+    app.want_tb.set(False)
+    generate_sv(app, tmp_path / "quiet.sv", monkeypatch)
+    assert not (tmp_path / "quiet_tb.sv").exists()
+
+
+def test_vhdl_comes_out_too(app, tmp_path, monkeypatch):
+    go_fixed(app, 12)
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                        lambda **kw: str(tmp_path / "dut.vhd"))
+    app.save_vhdl_source()
+    src = (tmp_path / "dut.vhd").read_text()
+    assert "entity dut is" in src
+    assert "use ieee.numeric_std.all;" in src
+    assert (tmp_path / "dut_tb.vhd").exists()
+
+
+def test_a_wide_word_is_refused_for_vhdl_with_a_dialog(app, tmp_path,
+                                                       monkeypatch):
+    shown = []
+    monkeypatch.setattr(gui.messagebox, "showerror",
+                        lambda title, msg: shown.append(msg))
+    go_fixed(app, 32)
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                        lambda **kw: str(tmp_path / "wide.vhd"))
+    app.save_vhdl_source()
+    assert shown and "integer generics" in shown[0]
+    assert not (tmp_path / "wide.vhd").exists()
+
+
+def test_the_smallest_word_length_is_reported(app):
+    app.load_preset("Lowpass")
+    app.use_spec.set(True)
+    app._spec_toggled()
+    go_fixed(app, 8)
+    smallest = app._smallest_word_length()
+    assert smallest and 8 < smallest < 32
+    assert f"{smallest} bits" in app.arith_status.get()
+    assert "narrowest that meets the spec" in report_text(app)
+
+    # It is the smallest: one bit fewer must miss.
+    app.word_bits.set(smallest)
+    app._arith_changed()
+    assert all(d <= w * 1.0001
+               for d, w in zip(app.eff.band_deviation, app.spec_dev))
+    app.word_bits.set(smallest - 1)
+    app._arith_changed()
+    assert any(d > w * 1.0001
+               for d, w in zip(app.eff.band_deviation, app.spec_dev))
+
+
+def test_the_noise_floor_is_measured_and_plotted(app):
+    go_fixed(app, 10)
+    app.show_noise.set(True)
+    app._noise_toggled()
+    labels = [str(ln.get_label()) for ln in app.ax_mag.get_lines()]
+    assert any("arithmetic noise" in x for x in labels)
+    assert any("as measured" in x for x in labels)
+    assert "arithmetic noise" in report_text(app)
+
+    f, noise_db, rms = app._noise_floor()
+    assert f.size > 100 and rms > 0
+    # Wider coefficients put the floor lower.
+    quiet = float(np.median(noise_db))
+    app.word_bits.set(16)
+    app._arith_changed()
+    assert float(np.median(app._noise_floor()[1])) < quiet - 10
+
+
+def test_the_noise_floor_is_not_claimed_in_floating_point(app):
+    app.show_noise.set(True)
+    app.redraw()
+    labels = [str(ln.get_label()) for ln in app.ax_mag.get_lines()]
+    assert not any("arithmetic noise" in x for x in labels)
+    assert app._noise_floor() is None
+
+
+def test_a_design_round_trips_through_json(app, tmp_path, monkeypatch):
+    app.fs.set(48000.0)
+    app.load_preset("Bandpass")          # the preset scales its edges by fs
+    app.numtaps.set(37)
+    app.design()
+    go_fixed(app, 14)
+    app.headroom.set(5)
+    app.structure.set("tree")
+    app.folded.set(True)
+    app.show_noise.set(True)
+    app._arith_changed()
+    before = app.to_dict()
+
+    path = tmp_path / "design.json"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    app.save_design()
+    assert path.exists()
+
+    # Change everything, then load it back.
+    app.load_preset("Lowpass")
+    app.numtaps.set(9)
+    app.fs.set(1.0)
+    app.arith.set(gui.ARITH_FLOAT)
+    app.structure.set("chain")
+    app.folded.set(False)
+    app.show_noise.set(False)
+    app.design()
+
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **kw: str(path))
+    app.open_design()
+    assert app.to_dict() == before
+    assert app.result.numtaps == 37
+    assert app.fixed is not None and app.fixed.bits == 14
+    assert app.headroom.get() == 5
+
+
+def test_an_iir_design_round_trips_too(iir, tmp_path, monkeypatch):
+    iir.load_iir_preset("Chebyshev I lowpass")
+    iir.design()
+    go_fixed(iir, 18)
+    before = iir.to_dict()
+    path = tmp_path / "iir.json"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    iir.save_design()
+
+    iir.mode.set(gui.MODE_FIR)
+    iir.switch_mode()
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **kw: str(path))
+    iir.open_design()
+    assert iir.is_iir()
+    assert iir.to_dict() == before
+    assert iir.iir_result is not None
+
+
+def test_a_file_that_is_not_a_design_is_refused(app, tmp_path, monkeypatch):
+    shown = []
+    monkeypatch.setattr(gui.messagebox, "showerror",
+                        lambda title, msg: shown.append(msg))
+    bad = tmp_path / "other.json"
+    bad.write_text('{"hello": 1}')
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **kw: str(bad))
+    app.open_design()
+    assert shown
+    assert app.result is not None          # the current design is left alone
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json")
+    monkeypatch.setattr(gui.filedialog, "askopenfilename",
+                        lambda **kw: str(broken))
+    app.open_design()
+    assert len(shown) == 2
+
+
+def test_a_degenerate_design_is_not_given_a_noise_floor(app):
+    # Setting the sample rate after a preset leaves the bands absurdly narrow
+    # for the tap count, the amplitude runs away in the transition, and there is
+    # nothing to measure.  It must say so rather than plot nonsense.
+    app.load_preset("Bandpass")
+    app.fs.set(48000.0)
+    app.numtaps.set(37)
+    app.design()
+    go_fixed(app, 14)
+    app.show_noise.set(True)
+    app._noise_toggled()
+    assert app._noise_floor() is None
+    labels = [str(ln.get_label()) for ln in app.ax_mag.get_lines()]
+    assert not any("arithmetic noise" in x for x in labels)
+    assert "could not be measured" in report_text(app)
+
+
+# ------------------------------------------------------- collapsible panels
+
+
+def test_every_panel_on_the_left_can_be_folded_away(app):
+    assert set(app.panels) == {"Filter", "Bands and constraints", "Filter (IIR)",
+                               "Bands and specification", "Arithmetic",
+                               "Display", "Result"}
+    for title, panel in app.panels.items():
+        assert panel.collapsed is False, title
+        assert panel.button.winfo_exists()
+        panel.toggle()
+        assert panel.collapsed is True, title
+        # grid_info empties when a widget is removed from the grid, and unlike
+        # winfo_ismapped it means something for a window that is withdrawn.
+        assert panel.body.grid_info() == {}, title
+        panel.toggle()
+        assert panel.collapsed is False, title
+        assert panel.body.grid_info() != {}, title
+
+
+def test_the_button_says_which_way_it_goes(app):
+    panel = app.panels["Arithmetic"]
+    assert panel.button.cget("text") == gui.Panel.SHOWN
+    panel.toggle()
+    assert panel.button.cget("text") == gui.Panel.HIDDEN
+    panel.toggle()
+    assert panel.button.cget("text") == gui.Panel.SHOWN
+
+
+def test_the_control_is_at_the_top_right_of_the_panel(app):
+    for title, panel in app.panels.items():
+        head = panel.button.master
+        info = panel.button.grid_info()
+        # Last column of the header row, and the header is the panel's first row.
+        assert int(info["row"]) == 0, title
+        assert int(info["column"]) == 1, title
+        assert "e" in str(info["sticky"]), title
+        assert int(head.grid_info()["row"]) == 0, title
+
+
+def test_folding_a_panel_gives_its_space_to_the_others(app):
+    root = app.root
+    root.deiconify()                     # geometry is only real once mapped
+    root.geometry("1360x700")            # a laptop, where they do not all fit
+    for _ in range(6):
+        root.update()
+    bands = app.panels["Bands and constraints"]
+    before = bands.winfo_height()
+
+    for name in ("Result", "Display", "Arithmetic"):
+        app.panels[name].toggle()
+    for _ in range(6):
+        root.update()
+
+    assert bands.winfo_height() > before
+    # A folded panel keeps only its header.
+    for name in ("Result", "Display", "Arithmetic"):
+        panel = app.panels[name]
+        assert panel.winfo_height() < 60
+        assert panel.button.grid_info() != {}      # the header stays
+    root.withdraw()
+
+
+def test_a_folded_panel_claims_no_share_of_the_leftover_height(app):
+    parent = app.panels["Result"].master
+    row = app.panels["Result"].grid_info()["row"]
+    assert parent.rowconfigure(row)["weight"] in (1, "1")
+    app.panels["Result"].toggle()
+    assert parent.rowconfigure(row)["weight"] in (0, "0")
+    app.panels["Result"].toggle()
+    assert parent.rowconfigure(row)["weight"] in (1, "1")
+
+
+def test_folding_does_not_disturb_the_design(app):
+    before = app.result.h.copy()
+    for panel in app.panels.values():
+        panel.toggle()
+    assert np.array_equal(app.result.h, before)
+    assert app.result is not None
+    # And the fields are still there to be read once unfolded.
+    for panel in app.panels.values():
+        panel.toggle()
+    app.rows[0].vars[1].set("0.15")
+    app.design()
+    assert not np.array_equal(app.result.h, before)
+
+
+def test_which_panels_are_folded_is_saved_with_the_design(app, tmp_path,
+                                                          monkeypatch):
+    app.panels["Display"].toggle()
+    app.panels["Arithmetic"].toggle()
+    before = app.to_dict()
+    assert before["display"]["folded_panels"] == ["Arithmetic", "Display"]
+
+    path = tmp_path / "layout.json"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    app.save_design()
+
+    app.panels["Display"].toggle()          # open them again
+    app.panels["Arithmetic"].toggle()
+    app.panels["Result"].toggle()           # and fold a different one
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **kw: str(path))
+    app.open_design()
+
+    assert app.panels["Display"].collapsed
+    assert app.panels["Arithmetic"].collapsed
+    assert not app.panels["Result"].collapsed
+    assert app.to_dict() == before
+
+
+def test_folding_survives_a_mode_switch(iir):
+    iir.panels["Arithmetic"].toggle()
+    assert iir.panels["Arithmetic"].collapsed
+    iir.mode.set(gui.MODE_FIR)
+    iir.switch_mode()
+    assert iir.panels["Arithmetic"].collapsed
+    assert iir.result is not None

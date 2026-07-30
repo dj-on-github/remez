@@ -31,6 +31,10 @@ Requires numpy and matplotlib; the algorithms themselves (`fir_core.py` and
 `iir_core.py`) need only numpy. scipy is used by the tests to cross-check
 designs, not by the program.
 
+The generated RTL is checked by the tests with `verilator` (SystemVerilog) and
+`ghdl` (VHDL) where they are installed; both are optional and those tests skip
+themselves without them.
+
 ## FIR mode
 
 **Filter** sets the length, the symmetry, and the sample rate. Band edges are
@@ -56,8 +60,10 @@ computed for you. The report then says whether each spec was actually met, and
 if not, roughly how many taps it would take (Kaiser's estimate).
 
 Press **Design**, Return or F5 after editing. Coefficients export as CSV or as a
-C header, the plot exports as PNG, PDF or SVG, and **Save C…** writes a working
-implementation — see [Save C](#save-c) below.
+C header, the plot exports as PNG, PDF or SVG, **Save C…** writes a working
+implementation — see [Save C](#save-c) — and **Generate SV…** / **Generate
+VHDL…** write hardware, see [Generating hardware](#generating-hardware). The
+whole specification saves to JSON with **Save design…**.
 
 The four panels show:
 
@@ -126,11 +132,16 @@ untick the box to set it yourself. The panel reports the format, the resolution,
 the representable range and the largest rounding error, and says so loudly if
 anything had to be clipped to fit.
 
-Two more settings in the panel belong to the hardware rather than the
-coefficients, and are described under [Generate SV](#generate-sv):
-**headroom**, which widens the datapath above the coefficient format, and
-**fixed coefficients**, which decides whether the RTL builds the values in or
-takes them on a port.
+The panel also reports **the narrowest word length that still meets the
+specification**, so the question the word-length spinbox otherwise gets walked
+up and down to answer is simply answered. Against the dB specs when they are in
+use, and otherwise against the design's own deviation with a quarter of a dB of
+slack on it.
+
+The rest of the panel belongs to the hardware rather than the coefficients, and
+is described under [Generating hardware](#generating-hardware): **headroom**,
+**fixed coefficients**, the **structure**, whether to **fold the symmetry**, and
+whether to write a **testbench**.
 
 Rounding is not free, and the point of showing it is that the cost is specific
 and visible:
@@ -146,16 +157,56 @@ and visible:
   the passband gain, which peak-to-peak ripple does not reveal, so that is
   reported separately.
 
-What is modelled is coefficient quantization only. The arithmetic in the
-datapath — rounding of products, accumulator width, overflow behaviour — is a
-separate question and is not simulated.
+By default what is modelled is coefficient quantization only: the plots show
+what exact arithmetic would do with rounded coefficients. Tick **Measure the
+fixed-point noise floor** and the datapath itself is measured as well — see
+below.
+
+## The measured noise floor
+
+Rounding the coefficients is not the only thing finite arithmetic does. Every
+product is rounded, and for a long filter that noise, not the coefficients, is
+what sets the stopband floor you can actually measure.
+
+Ticking the display option runs white noise through a bit-exact model of the
+generated datapath — the same model the RTL is tested against — and compares it
+against the same filter computed exactly. The difference is purely what the
+arithmetic did, so it can be measured without a dynamic range problem; taking
+the output spectrum directly would measure the analysis window's sidelobes
+instead, since a passband sixty dB above a stopband leaks into it. Two curves
+appear:
+
+- **arithmetic noise**, referred to the input, for a drive 12 dB below full
+  scale (the level is stated in the legend, because rounding and saturation are
+  level dependent);
+- **as measured**, the response with that noise added in power, which is what a
+  bench would show. A stopband thirty dB below the floor is simply not there to
+  be measured.
+
+The measurement agrees with `q·sqrt(N/12)` — the standard result for rounding N
+products — to better than a dB from 8 to 24 bit coefficients, and there is a
+test asserting exactly that. Two consequences worth knowing: four more
+coefficient bits buy 24 dB of floor, and folding a symmetric filter buys 3 dB,
+because it rounds once per pair instead of once per tap.
+
+A degenerate design, one whose amplitude runs away in an unconstrained
+transition band, has no measurable floor and says so rather than plotting
+nonsense.
+
+## Saving a design
+
+**Save design…** writes the whole specification to JSON — mode, band table or
+IIR spec, sample rate, arithmetic and hardware settings, display options — and
+**Open design…** puts every control back where it was and redesigns. Anything
+missing from the file keeps its current value, so a design saved by an older
+version still opens.
 
 ## Save C
 
 **Save C…** asks where to put it and writes a self-contained C file that
 implements the filter currently on screen — the biquad cascade in IIR mode, the
 tapped delay line in FIR mode.  For hardware rather than software, see
-[Generate SV](#generate-sv). The interface is the same either way:
+[Generating hardware](#generating-hardware). The interface is the same either way:
 
 ```c
 typedef struct { ... } t_ctx;
@@ -182,26 +233,30 @@ program that filters whitespace-separated doubles from stdin to stdout:
 cc -std=c99 -O2 -DFILTER_MAIN -o myfilter myfilter.c && ./myfilter < in.txt > out.txt
 ```
 
-## Generate SV
+## Generating hardware
 
-**Generate SV…** writes the structure the design view draws as synthesisable
-SystemVerilog. It needs fixed-point coefficients — there is nothing to build a
-multiplier from otherwise — and refuses, with a reason, if any coefficient
-saturated when it was quantized.
+**Generate SV…** and **Generate VHDL…** write the structure the design view
+draws as synthesisable RTL. Both need fixed-point coefficients — there is
+nothing to build a multiplier from otherwise — and refuse, with a reason, if any
+coefficient saturated when it was quantized. With **write a self-checking
+testbench beside it** ticked, a `<name>_tb` file is written next to the design.
 
-One file comes out, holding four modules plus the filter. The names are taken
-from the filename you choose, so two generated filters can live in one project:
+One file per language, holding the filter and the parts it is built from. The
+names are taken from the filename you choose, so two generated filters can live
+in one project:
 
-| module | what it is |
+| module / entity | what it is |
 | --- | --- |
 | `<name>_mul` | one coefficient multiply: exact product, rounded to nearest, saturated back to the datapath width |
 | `<name>_add` | one datapath-width add, saturating |
-| `<name>_sat` | clamps a wide signed value into a narrow one, used by both |
-| `<name>_delay` | one unit delay, advancing only when `din_strb` is seen |
-| `<name>` | the filter, instantiating the above in the topology of the design |
+| `<name>_addw` | the widening pre-adder a folded filter needs (only emitted when folding) |
+| `<name>_sat` | clamps a wide signed value into a narrow one, used by the others |
+| `<name>_delay` | one register: the filter's unit delay, and the pipeline register between adder-tree levels |
+| `<name>` | the filter |
 
 ```systemverilog
-module <name> #(parameter int NTAPS, WCOEF, FRAC, HEADROOM, WDATA) (
+module <name> #(parameter int NTAPS, NTERM, NCOEF, WCOEF, FRAC, HEADROOM,
+                              LATENCY, WDATA) (
     input  wire                     clk,
     input  wire                     resetn,     // synchronous, active low
     input  wire signed [WDATA-1:0]  din,
@@ -211,43 +266,82 @@ module <name> #(parameter int NTAPS, WCOEF, FRAC, HEADROOM, WDATA) (
 );
 ```
 
-A strobe on `din_strb` with a sample on `din` advances the delay line and
-registers the result, which appears on `dout` with `dout_strb` high for one
-cycle — one clock of latency. Samples may arrive as slowly as you like; the
-delay elements only move when strobed.
+A strobe on `din_strb` with a sample on `din` advances the delay line, and the
+result appears on `dout` with `dout_strb` high for one cycle, `LATENCY` clocks
+later. Samples may arrive as slowly as you like; the delay elements only move
+when strobed.
 
 **Numbers.** Coefficients are `WCOEF` bits with `FRAC` fractional bits, exactly
 as the Arithmetic panel quantized them. The datapath carries the same `FRAC`
-fractional bits and `HEADROOM` extra integer bits, so everything — `din`,
-`dout` and every internal signal — is `WDATA = WCOEF + HEADROOM` bits, and
-unity is `1 << FRAC`. The **headroom** setting is what keeps the adder chain off
-its limits: a direct-form FIR sums N products, and with no integer bits above
-the coefficient format that sum clips. Adds saturate rather than wrap, because a
-filter that clips is bad and one that wraps is unrecognisable.
+fractional bits and `HEADROOM` extra integer bits, so everything is
+`WDATA = WCOEF + HEADROOM` bits and unity is `1 << FRAC`. The **headroom**
+setting is what keeps the adders off their limits: a direct-form FIR sums N
+products, and with no integer bits above the coefficient format that sum clips.
+Adds saturate rather than wrap, because a filter that clips is bad and one that
+wraps is unrecognisable.
 
-**Coefficients.** With **fixed coefficients** ticked the values are
-elaboration-time parameters, so synthesis can specialise every multiplier —
-often into a few shifts and adds — and there is no coefficient port. Untick it
-and the top level gains a packed `coeff` input that can be changed while the
-filter runs, at the cost of real multipliers. The header comment lists which
-slice holds which coefficient. For an IIR the slots are `b0 b1 b2 a1 a2` per
-section, given exactly as designed: `a0` is 1 and nothing multiplies by it, and
-`a1`/`a2` are negated inside the multiplier so the recursion's subtractions
-need no separate subtractor.
+### Structure
 
-An IIR comes out as a cascade of biquads in transposed direct form II, the same
-arrangement the design view draws and the generated C runs.
+For a FIR, the **structure** trades combinational depth against area. A chain of
+N adders is the smallest and the slowest — a 200-tap filter is a 200-deep
+saturating adder chain, which will not close timing at any interesting clock.
 
-One caveat on the plots: they show the response of the quantized *coefficients*
-in exact arithmetic. The RTL additionally rounds every product and saturates
-every add, so its response is close to the plotted one but not identical.
-`sv_export.simulate` is a bit-exact model of the generated datapath if you want
-to see the difference for a given signal.
+| structure | multipliers | adders | latency | for |
+| --- | --- | --- | --- | --- |
+| `chain` | one per term | one per term | 1 clock | short filters |
+| `tree` | one per term | one per term | 1 + ceil(log2 N) | long filters at speed |
+| `mac` | **one** | one | N + 2 clocks | a sample rate well below the clock |
 
-The RTL lints clean under `verilator --lint-only -Wall`, and the tests compile
-it and run it against a bit-exact Python model of the same datapath, sample for
-sample, in both coefficient modes and for both filter kinds. An impulse pushed
-through the compiled hardware returns the quantized taps exactly.
+The tree registers between levels, so its latency is in clocks rather than
+logic. The MAC reuses a single multiplier over a register-file delay line at one
+term per clock; it needs the strobes at least `LATENCY` apart and ignores any
+that arrive while it is busy. Its coefficients become a ROM read by the term
+counter — one shared multiplier cannot be specialised per tap however the
+coefficients are supplied.
+
+An IIR is a cascade of biquads whatever you pick: there is nothing to fold, and
+its feedback cannot be pipelined without changing the filter, so those two
+controls grey out in IIR mode.
+
+### Folding
+
+A linear-phase response has symmetric taps, so `h[k]·x[k] + h[k]·x[N-1-k]` is
+one multiply on a pre-added pair, and **fold the symmetry** halves the
+multiplier count — 41 taps down to 21, or 16 down to 8 for an antisymmetric
+filter, whose pre-adders subtract and whose zero centre tap drops out entirely.
+
+Two things follow that are easy to get wrong, and both are tested. The pre-adder
+is one bit wider than the datapath and does not saturate: it sums two samples
+that may each be at full scale, and clipping that would throw signal away.
+And a folded filter rounds once per pair rather than once per tap, so it is not
+bit-identical to the unfolded one — its noise floor is 3 dB lower.
+
+### Coefficients
+
+With **fixed coefficients** ticked the values are elaboration-time parameters,
+so synthesis can specialise every multiplier — often into a few shifts and adds
+— and there is no coefficient port. Untick it and the top level gains a packed
+`coeff` input that can be changed while the filter runs. The header comment
+lists which slice holds which coefficient; note that folding stores one
+coefficient per *pair*, so the vector is half the length. For an IIR the slots
+are `b0 b1 b2 a1 a2` per section, given exactly as designed: `a0` is 1 and
+nothing multiplies by it, and `a1`/`a2` are negated inside the multiplier so the
+recursion's subtractions need no separate subtractor.
+
+### What has actually been checked
+
+The SystemVerilog lints clean under `verilator --lint-only -Wall` and is
+compiled and run against a bit-exact Python model of the same datapath, in every
+structure, folded and unfolded, with coefficients built in and on a port, for
+both filter kinds. The VHDL is VHDL-93 with `ieee.numeric_std`, and is analysed,
+elaborated and simulated the same way under `ghdl`. The generated testbenches
+are what does the comparing: they carry the expected output of every sample, so
+a PASS means the RTL and the model agree exactly. An impulse pushed through the
+compiled hardware returns the quantized taps.
+
+The VHDL path carries coefficients as `integer` generics, which limits it to 31
+coefficient bits; it says so and points at the SystemVerilog output if you ask
+for more.
 
 ## Design view
 
@@ -361,10 +455,18 @@ Two numerical details are worth knowing about, and each has a test:
 .venv/bin/python -m pytest -q
 ```
 
-`test_sv.py` checks the generated RTL: that it lints without a warning, that
-what Verilator computes matches the Python model of the datapath bit for bit,
-that runtime coefficients give the same answer as built-in ones, that an impulse
-returns the taps, and that headroom is what stops the adder chain clipping.
+`test_datapath.py` checks the arithmetic model: that products round to nearest
+and everything saturates rather than wraps, that a chain and a tree agree until
+something clips and differ afterwards, that folding halves the multiplies and
+lowers the noise floor by 3 dB, and that the measured floor matches
+`q·sqrt(N/12)` from 8 to 22 bits.
+
+`test_sv.py` and `test_vhdl.py` check the generated RTL: that it lints or
+analyses without a warning in every structure, that a simulator running it
+agrees with the Python model sample for sample, that runtime coefficients give
+the same answer as built-in ones, that an impulse returns the taps, and that
+both languages describe the same hardware down to the expected test vectors.
+The simulator tests skip themselves where the toolchain is missing.
 
 `test_fixed_point.py` checks the quantization: that values land on the lattice,
 that the automatic binary point gives away no resolution, that linear phase
