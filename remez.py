@@ -236,6 +236,7 @@ class RemezApp:
     def __init__(self, root):
         self.root = root
         root.title("Digital filter designer — Remez FIR and classical IIR")
+        self._set_icon(root)
         root.geometry("1360x900")
         self.rows = []
         self.result = None
@@ -293,6 +294,38 @@ class RemezApp:
         # No multi-line field takes a plain Return, so it can mean "design".
         for key in ("<Return>", "<KP_Enter>", "<Control-Return>", "<F5>"):
             root.bind(key, lambda e: self.design())
+
+    def _set_icon(self, root):
+        """Give the window the program's icon, where the platform allows it.
+
+        iconphoto is the portable one and is what Linux and Windows use for the
+        window; iconbitmap takes the .ico and is what Windows wants for the
+        taskbar.  A macOS Dock icon needs an application bundle rather than a
+        running interpreter, so it will not change there.  None of this is worth
+        failing to start over, so every step is allowed to decline.
+        """
+        folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs")
+        images = []
+        for size in (256, 32, 16):
+            path = os.path.join(folder, f"icon-{size}.png")
+            if os.path.exists(path):
+                try:
+                    images.append(tk.PhotoImage(file=path))
+                except tk.TclError:
+                    pass
+        if images:
+            # Tk drops an image the moment nothing refers to it.
+            self._icon_images = images
+            try:
+                root.iconphoto(True, *images)
+            except tk.TclError:
+                pass
+        ico = os.path.join(folder, "icon.ico")
+        if os.path.exists(ico):
+            try:
+                root.iconbitmap(ico)
+            except tk.TclError:
+                pass                    # not a format this platform accepts
 
     def _place_sash(self):
         """Give the controls the width they asked for, the plot the rest.

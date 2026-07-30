@@ -32,6 +32,22 @@ makes lower panels drift to the bottom edge. The report at the bottom scrolls
 itself, so it is a fixed height, and its scrollbar is inset from the one that
 scrolls the whole column.
 
+## The icon
+
+`docs/icon.ico` is the program's icon: the magnitude response of an equiripple
+lowpass filter, which is the one picture this program makes that nothing else
+does.
+
+![the icon at every size it is drawn at](docs/icon-preview.png)
+
+It is generated rather than drawn by hand, by `python make_icon.py`, and each
+size is drawn to suit itself rather than resampled from one master. At 256
+pixels the passband ripple and the three stopband lobes are the point of it; by
+24 the ripple is gone and two lobes are left; by 16 the white curve would be as
+thick as the shape it sits on, so the silhouette carries it alone — shelf,
+cliff, floor. The file holds all eight sizes from 16 to 256, with 16, 32 and 256
+also written as PNGs for the window icon.
+
 ## Running it
 
 ```bash
