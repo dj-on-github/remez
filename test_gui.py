@@ -15,7 +15,7 @@ import pytest
 tk = pytest.importorskip("tkinter")
 import iir_core as ii  # noqa: E402
 import fir_core as rz  # noqa: E402
-import remez_gui as gui  # noqa: E402
+import remez as gui  # noqa: E402
 
 
 @pytest.fixture
@@ -1361,3 +1361,87 @@ def test_folding_survives_a_mode_switch(iir):
     iir.switch_mode()
     assert iir.panels["Arithmetic"].collapsed
     assert iir.result is not None
+
+
+# ------------------------------------------------------------------ the CLI
+
+
+def test_the_parser_accepts_nothing_at_all(app):
+    args = gui.build_parser().parse_args([])
+    assert args.design is None
+    assert args.geometry is None
+
+
+def test_help_and_version_exit_cleanly_without_a_window(capsys):
+    for flag in ("--help", "--version"):
+        with pytest.raises(SystemExit) as exit:
+            gui.build_parser().parse_args([flag])
+        assert exit.value.code == 0
+        out = capsys.readouterr().out
+        assert out.strip()
+        if flag == "--help":
+            assert "DESIGN.json" in out and "--geometry" in out
+        else:
+            assert gui.__version__ in out
+
+
+def test_an_unknown_option_is_refused(capsys):
+    with pytest.raises(SystemExit) as exit:
+        gui.build_parser().parse_args(["--wat"])
+    assert exit.value.code == 2
+    assert "unrecognized" in capsys.readouterr().err
+
+
+def test_the_arguments_are_read(app):
+    args = gui.build_parser().parse_args(["thing.json", "--geometry", "1280x800"])
+    assert args.design == "thing.json"
+    assert args.geometry == "1280x800"
+
+
+def test_a_design_given_on_the_command_line_is_loaded(app, tmp_path,
+                                                      monkeypatch):
+    app.load_preset("Bandpass")
+    app.numtaps.set(37)
+    app.design()
+    go_fixed(app, 14)
+    app.structure.set("tree")
+    app.folded.set(True)
+    app._arith_changed()
+    wanted = app.to_dict()
+
+    path = tmp_path / "cli.json"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    app.save_design()
+
+    # What main() does with the argument, short of entering the mainloop.
+    state = gui.read_design(str(path))
+    fresh = tk.Tk()
+    try:
+        fresh.withdraw()
+        other = gui.RemezApp(fresh)
+        other.from_dict(state)
+        assert other.to_dict() == wanted
+        assert other.result.numtaps == 37
+        assert other.structure.get() == "tree" and other.folded.get()
+    finally:
+        fresh.destroy()
+
+
+def test_a_missing_design_file_is_reported_not_raised(capsys):
+    assert gui.main(["definitely-not-here.json"]) == 2
+    assert "cannot open" in capsys.readouterr().err
+
+
+def test_a_file_that_is_not_a_design_is_reported(tmp_path, capsys):
+    path = tmp_path / "other.json"
+    path.write_text('{"hello": 1}')
+    assert gui.main([str(path)]) == 2
+    err = capsys.readouterr().err
+    assert "not a design this can load" in err
+
+
+def test_neither_failure_leaves_a_window_behind(tmp_path):
+    """main() must not enter the mainloop, or the test suite would hang."""
+    path = tmp_path / "bad.json"
+    path.write_text("{not json")
+    assert gui.main([str(path)]) == 2

@@ -55,7 +55,14 @@ python3 -m venv --system-site-packages .venv && .venv/bin/pip install -r require
 ```
 
 ```bash
-.venv/bin/python remez_gui.py
+.venv/bin/python remez.py
+```
+
+`--help` lists the options. A saved design can be opened straight away, and the
+window size set, which is worth knowing on a short screen:
+
+```bash
+.venv/bin/python remez.py mydesign.json --geometry 1280x800
 ```
 
 Requires numpy and matplotlib; the algorithms themselves (`fir_core.py` and

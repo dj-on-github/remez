@@ -97,7 +97,7 @@ def test_the_window_takes_the_icon_without_complaining():
     except tk.TclError:
         pytest.skip("no display available")
     try:
-        import remez_gui as gui
+        import remez as gui
         app = gui.RemezApp(root)
         root.update()
         # Loaded and, importantly, still referenced: Tk drops an image as soon
