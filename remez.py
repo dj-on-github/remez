@@ -125,6 +125,15 @@ IIR_PRESETS = {
 }
 
 
+def _number(value):
+    """A field's worth of number: readable, and precise enough to scale back.
+
+    %g at the default six figures turns 5925.925872 into 5925.93, and the
+    original would not come back when the rate was set back.
+    """
+    return f"{value:.10g}"
+
+
 def db(x, floor=1e-12):
     return 20.0 * np.log10(np.maximum(np.abs(x), floor))
 
@@ -292,6 +301,7 @@ class RemezApp:
         self.paned = paned
         root.after_idle(self._place_sash)
 
+        self._sync_sample_rate()
         self.load_preset("Lowpass")
         self.design()
 
@@ -623,7 +633,9 @@ class RemezApp:
                     command=self.design).grid(row=0, column=1, sticky="ew", padx=(2, 8))
 
         ttk.Label(box, text="Sample rate").grid(row=0, column=2, sticky="w")
-        ttk.Entry(box, textvariable=self.fs, width=10).grid(row=0, column=3, sticky="ew", padx=2)
+        self._watch_sample_rate(
+            ttk.Entry(box, textvariable=self.fs, width=10)
+        ).grid(row=0, column=3, sticky="ew", padx=2)
 
         ttk.Label(box, text="Symmetry").grid(row=1, column=0, sticky="w", pady=(4, 0))
         sym = ttk.Combobox(box, textvariable=self.symmetry, width=15, state="readonly",
@@ -707,7 +719,7 @@ class RemezApp:
         # The sample rate is shared with FIR mode: it is a property of the
         # signal, not of how the filter happens to be designed.
         ttk.Label(box, text="Sample rate").grid(row=3, column=0, sticky="w", pady=(4, 0))
-        ttk.Entry(box, textvariable=self.fs, width=10).grid(
+        self._watch_sample_rate(ttk.Entry(box, textvariable=self.fs, width=10)).grid(
             row=3, column=1, sticky="ew", padx=(2, 8), pady=(4, 0))
 
         ttk.Label(box, text="Preset").grid(row=4, column=0, sticky="w", pady=(4, 0))
@@ -965,6 +977,79 @@ class RemezApp:
             bands.append(rz.Band(f1, f2, d1, d2, w1=w, w2=w,
                                  weight_kind="inv_f" if inv else "const"))
         return bands
+
+    def _watch_sample_rate(self, entry):
+        """Rescale the band edges when this entry's value is committed.
+
+        Not on every keystroke: a variable trace would fire on the "4" of
+        "48000" and rescale by four before the user had finished typing.
+        Committing means Return or moving the focus away.
+        """
+        entry.bind("<Return>", self._sample_rate_changed, add="+")
+        entry.bind("<KP_Enter>", self._sample_rate_changed, add="+")
+        entry.bind("<FocusOut>", self._sample_rate_changed, add="+")
+        return entry
+
+    def _sync_sample_rate(self):
+        """Take the current rate as the one the band edges are already in."""
+        try:
+            rate = float(self.fs.get())
+        except (tk.TclError, ValueError):
+            return
+        if rate > 0:
+            self.fs_baseline = rate
+
+    def _sample_rate_changed(self, _event=None):
+        """Move the band edges to the new units, keeping the same filter.
+
+        Edges are entered in whatever units the sample rate is in, so changing
+        1.0 to 48000 means the same 0.2 is now 9600 -- the number changes and
+        the filter does not.  Only frequencies move: gains, weights and the dB
+        specs mean the same thing at any rate.
+        """
+        # FocusOut arrives while a window is being torn down as well as when
+        # the user clicks away, and redrawing into half-destroyed widgets is
+        # not worth finding out the consequences of.
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            rate = float(self.fs.get())
+        except (tk.TclError, ValueError):
+            return                          # mid-edit, or not a number yet
+        old = getattr(self, "fs_baseline", None)
+        if not (rate > 0) or not old or rate == old:
+            if rate > 0:
+                self.fs_baseline = rate
+            return
+
+        ratio = rate / old
+        self.fs_baseline = rate
+        for var in self._frequency_fields():
+            try:
+                value = float(var.get())
+            except ValueError:
+                continue                    # leave anything unparsed alone
+            var.set(_number(value * ratio))
+        try:
+            self.design()
+        except tk.TclError:
+            pass
+
+    def _frequency_fields(self):
+        """Every entry holding a frequency, in either mode.
+
+        Both mode panels are kept up to date, not just the visible one: the
+        rate is shared between them, and a stale edge in the other mode would
+        be wrong the moment it was switched to.
+        """
+        fields = []
+        for row in self.rows:
+            fields += row.vars[:2]          # F start and F stop
+        fields += list(self.iir_wp) + list(self.iir_ws)
+        return fields
 
     def is_fixed(self):
         return self.arith.get() == ARITH_FIXED
@@ -1242,9 +1327,8 @@ class RemezApp:
 
         ax.set_xlim(0, nyq)
         if log:
-            floor = min(-20.0, 20 * np.log10(max(abs(res.delta), 1e-12)) - 25)
             top = max(5.0, np.nanmax(y[np.isfinite(y)]) + 5)
-            ax.set_ylim(max(floor, -220), top)
+            ax.set_ylim(self._magnitude_floor(res, eff), top)
             ax.set_ylabel("amplitude (dB)")
         else:
             ax.set_ylabel("amplitude")
@@ -1335,6 +1419,37 @@ class RemezApp:
         self.redraw()
         if (self.result if not self.is_iir() else self.iir_result) is not None:
             self._report()
+
+    def _magnitude_floor(self, res, eff):
+        """How far down the magnitude plot has to reach, in dB.
+
+        Not from delta.  That is the *weighted* deviation, and once the weights
+        come from dB specs it is essentially the passband's number: ask for
+        0.5 dB of ripple and 80 dB of attenuation and delta lands near -19 dB,
+        which would cut the stopband off the bottom of the plot along with the
+        spec line it is being judged against.
+
+        What has to be visible is the level each band is actually held to: the
+        top of its tolerance band, the deviation it achieved, and the spec it
+        was asked for.  For a stopband those are the attenuation; for a
+        passband they sit near its gain and never win the minimum.
+        """
+        levels = []
+        for index, band in enumerate(res.bands):
+            _, des, tol = self._band_curves(res, band)
+            target = float(np.max(np.abs(des)))
+            levels.append(float(np.max(des + tol)))
+            levels.append(target + float(eff.band_deviation[index]))
+            if self.spec_dev is not None:
+                levels.append(target + float(self.spec_dev[index]))
+
+        deepest = db(min(levels)) if levels else -60.0
+        if self.show_noise.get():
+            measured = self._noise_floor()
+            if measured is not None:
+                deepest = min(deepest, float(np.median(measured[1])))
+        # Room below the deepest line, so the response is not clipped to it.
+        return max(min(deepest - 15.0, -20.0), -220.0)
 
     def _draw_noise(self, ax, res):
         """The measured arithmetic noise, and the response once it is included.
@@ -2116,6 +2231,9 @@ class RemezApp:
             raise ValueError("not a filter design file")
 
         self.fs.set(float(state.get("fs", self.fs.get())))
+        # The file's edges are already in the file's units, so this is the rate
+        # they are in -- not a change to scale from.
+        self._sync_sample_rate()
 
         fir = state.get("fir", {})
         if "numtaps" in fir:
@@ -2191,8 +2309,11 @@ class RemezApp:
             filetypes=[("C source", "*.c"), ("All files", "*")])
         if not path:
             return
-        source = (self._iir_c_source(res, self.fixed) if self.is_iir()
-                  else self._fir_c_source(res, self.fixed))
+        # The file's own name is what the program calls itself in its usage
+        # and error messages, until argv[0] says otherwise.
+        stem = rc.sanitise_name(os.path.splitext(os.path.basename(path))[0])
+        source = (self._iir_c_source(res, self.fixed, stem) if self.is_iir()
+                  else self._fir_c_source(res, self.fixed, stem))
         try:
             with open(path, "w") as fh:
                 fh.write(source)
@@ -2209,13 +2330,22 @@ class RemezApp:
             f" * {structure}",
             " * Generated by remez.py.",
             " *",
+            " * As a library:",
+            " *",
             " *     t_ctx ctx;",
             " *     if (init_filter(&ctx) != 0) ... out of memory ...",
             " *     for (...) y = process_sample(x, &ctx);",
             " *     free_filter(&ctx);",
             " *",
-            " * Compile with -DFILTER_MAIN for a stand-alone program that filters",
-            " * whitespace-separated doubles from stdin to stdout.",
+            " * As a program, which is what it builds as by default:",
+            " *",
+            " *     cc -O2 -o filter this.c",
+            " *     ./filter [-o outfile] [infile]",
+            " *",
+            " * It reads and writes raw 64 bit float samples in native byte",
+            " * order, stdin to stdout unless told otherwise.  Compile with",
+            " * -DFILTER_NO_MAIN to leave main out and link it into something",
+            " * else instead.",
             " */",
             "",
             "#include <stdlib.h>",
@@ -2224,32 +2354,176 @@ class RemezApp:
         ])
 
     @staticmethod
-    def _c_main():
+    def _c_main(name="filter"):
+        """The stand-alone program wrapped round the filter.
+
+        Raw 64 bit floats in native byte order, in and out: a filter is
+        usually one stage of a pipeline, and text costs a conversion each way
+        and every bit below the seventeenth digit.  Reads stdin and writes
+        stdout unless given filenames, so it composes.
+        """
         return "\n".join([
             "",
-            "#ifdef FILTER_MAIN",
+            "#ifndef FILTER_NO_MAIN",
+            "#include <errno.h>",
             "#include <stdio.h>",
+            "#include <string.h>",
             "",
-            "int main(void)",
+            "#ifdef _WIN32",
+            "#include <fcntl.h>",
+            "#include <io.h>",
+            "#else",
+            "#include <unistd.h>",
+            "#endif",
+            "",
+            "/* Samples carried per read; the buffer is doubles so it stays aligned. */",
+            "#define IO_SAMPLES 4096",
+            "",
+            f'static const char *progname = "{name}";',
+            "",
+            "static void usage(FILE *out)",
             "{",
-            "    t_ctx ctx;",
-            "    double x;",
+            '    fprintf(out, "usage: %s [-o outfile] [infile]\\n", progname);',
+            '    fprintf(out, "  Filters raw 64 bit float PCM samples (native byte order).\\n");',
+            '    fprintf(out, "  infile defaults to stdin, output defaults to stdout.\\n");',
+            "}",
             "",
-            "    if (init_filter(&ctx) != 0) {",
-            '        fprintf(stderr, "init_filter: out of memory\\n");',
+            "/* Filters in to out a block at a time.  Returns 0, or -1 after reporting",
+            "   an I/O error.  A trailing fragment shorter than one sample is reported",
+            "   and dropped. */",
+            "static int filter_stream(FILE *in, FILE *out, t_ctx *ctx)",
+            "{",
+            "    double buf[IO_SAMPLES];",
+            "    unsigned char *bytes = (unsigned char *) buf;",
+            "    size_t leftover = 0;",
+            "    size_t got;",
+            "",
+            "    while ((got = fread(bytes + leftover, 1, sizeof buf - leftover, in)) > 0) {",
+            "        size_t total = leftover + got;",
+            "        size_t count = total / sizeof(double);",
+            "        size_t i;",
+            "",
+            "        for (i = 0; i < count; i++)",
+            "            buf[i] = process_sample(buf[i], ctx);",
+            "",
+            "        if (count && fwrite(buf, sizeof(double), count, out) != count) {",
+            '            fprintf(stderr, "%s: write failed: %s\\n", progname, strerror(errno));',
+            "            return -1;",
+            "        }",
+            "",
+            "        /* Carry any bytes that did not complete a sample into the next read. */",
+            "        leftover = total - count * sizeof(double);",
+            "        if (leftover)",
+            "            memmove(bytes, bytes + count * sizeof(double), leftover);",
+            "    }",
+            "",
+            "    if (ferror(in)) {",
+            '        fprintf(stderr, "%s: read failed: %s\\n", progname, strerror(errno));',
+            "        return -1;",
+            "    }",
+            "    if (leftover)",
+            '        fprintf(stderr, "%s: ignoring %lu trailing byte(s), not a whole sample\\n",',
+            "                progname, (unsigned long) leftover);",
+            "",
+            "    return 0;",
+            "}",
+            "",
+            "int main(int argc, char **argv)",
+            "{",
+            "    const char *in_path = NULL;",
+            "    const char *out_path = NULL;",
+            "    FILE *in = stdin;",
+            "    FILE *out = stdout;",
+            "    t_ctx ctx;",
+            "    int status = 0;",
+            "    int i;",
+            "",
+            "    if (argc > 0 && argv[0] && argv[0][0])",
+            "        progname = argv[0];",
+            "",
+            "    for (i = 1; i < argc; i++) {",
+            '        if (strcmp(argv[i], "-o") == 0) {',
+            "            if (++i == argc) {",
+            '                fprintf(stderr, "%s: -o needs a filename\\n", progname);',
+            "                return 1;",
+            "            }",
+            "            out_path = argv[i];",
+            '        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {',
+            "            usage(stdout);",
+            "            return 0;",
+            '        } else if (strcmp(argv[i], "-") == 0) {',
+            "            in_path = NULL;             /* explicit stdin */",
+            "        } else if (argv[i][0] == '-' && argv[i][1]) {",
+            '            fprintf(stderr, "%s: unknown option: %s\\n", progname, argv[i]);',
+            "            usage(stderr);",
+            "            return 1;",
+            "        } else if (in_path == NULL) {",
+            "            in_path = argv[i];",
+            "        } else {",
+            '            fprintf(stderr, "%s: only one input file may be given\\n", progname);',
+            "            return 1;",
+            "        }",
+            "    }",
+            "",
+            "    if (in_path) {",
+            '        in = fopen(in_path, "rb");',
+            "        if (!in) {",
+            '            fprintf(stderr, "%s: %s: %s\\n", progname, in_path, strerror(errno));',
+            "            return 1;",
+            "        }",
+            "    }",
+            "",
+            "    if (out_path) {",
+            '        out = fopen(out_path, "wb");',
+            "        if (!out) {",
+            '            fprintf(stderr, "%s: %s: %s\\n", progname, out_path, strerror(errno));',
+            "            if (in != stdin)",
+            "                fclose(in);",
+            "            return 1;",
+            "        }",
+            "    }",
+            "",
+            "#ifdef _WIN32",
+            "    if (in == stdin)",
+            "        _setmode(_fileno(stdin), _O_BINARY);",
+            "    if (out == stdout)",
+            "        _setmode(_fileno(stdout), _O_BINARY);",
+            "#else",
+            "    /* Raw samples down a terminal are noise, and usually a forgotten -o. */",
+            "    if (out == stdout && isatty(fileno(stdout))) {",
+            '        fprintf(stderr, "%s: refusing to write binary samples to a terminal; "',
+            '                        "use -o or redirect\\n", progname);',
+            "        if (in != stdin)",
+            "            fclose(in);",
             "        return 1;",
             "    }",
-            "    while (scanf(\"%lf\", &x) == 1)",
-            '        printf("%.17g\\n", process_sample(x, &ctx));',
-            "    free_filter(&ctx);",
-            "    return 0;",
+            "#endif",
+            "",
+            "    if (init_filter(&ctx) != 0) {",
+            '        fprintf(stderr, "%s: init_filter: out of memory\\n", progname);',
+            "        status = 1;",
+            "    } else {",
+            "        if (filter_stream(in, out, &ctx) != 0)",
+            "            status = 1;",
+            "        free_filter(&ctx);",
+            "    }",
+            "",
+            "    if (in != stdin)",
+            "        fclose(in);",
+            "    if (fflush(out) != 0 || (out != stdout && fclose(out) != 0)) {",
+            '        fprintf(stderr, "%s: %s: %s\\n", progname,',
+            '                out_path ? out_path : "stdout", strerror(errno));',
+            "        status = 1;",
+            "    }",
+            "",
+            "    return status;",
             "}",
             "#endif",
             "",
         ])
 
     @staticmethod
-    def _iir_c_source(res, fixed=None):
+    def _iir_c_source(res, fixed=None, name="filter"):
         """A self-contained C implementation of the biquad cascade.
 
         The inner loop is the same transposed direct form II that
@@ -2323,10 +2597,10 @@ class RemezApp:
             "    }",
             "    return sample;",
             "}",
-        ]) + "\n" + RemezApp._c_main()
+        ]) + "\n" + RemezApp._c_main(name)
 
     @staticmethod
-    def _fir_c_source(res, fixed=None):
+    def _fir_c_source(res, fixed=None, name="filter"):
         """A self-contained C implementation of the tapped delay line.
 
         The delay line is a circular buffer, so nothing is copied per sample;
@@ -2388,7 +2662,7 @@ class RemezApp:
             "    ctx->pos = ctx->pos + 1 == ctx->taps ? 0 : ctx->pos + 1;",
             "    return acc;",
             "}",
-        ]) + "\n" + RemezApp._c_main()
+        ]) + "\n" + RemezApp._c_main(name)
 
     def save_plot(self):
         if (self.iir_result if self.is_iir() else self.result) is None:

@@ -264,12 +264,27 @@ stored integers and the binary point alongside them.
 
 The generated IIR code runs the same transposed direct form II in the same
 section order as `iir_core.sos_filter`, and a test compiles it and checks it
-agrees bit for bit. Compile it with `-DFILTER_MAIN` and you get a stand-alone
-program that filters whitespace-separated doubles from stdin to stdout:
+agrees bit for bit.
+
+**It builds as a program.** No defines needed — `main` is in unless you ask for
+it to be left out, which is the way round a generated filter is usually wanted:
 
 ```bash
-cc -std=c99 -O2 -DFILTER_MAIN -o myfilter myfilter.c && ./myfilter < in.txt > out.txt
+cc -std=c99 -O2 -o myfilter myfilter.c
+./myfilter recording.f64 -o filtered.f64      # or pipe it
+sox ... | ./myfilter | sox ...
 ```
+
+It reads and writes **raw 64 bit floats in native byte order**, stdin to stdout
+unless given filenames. A filter is usually one stage of a pipeline, and text
+would cost a conversion each way and every bit below the seventeenth digit.
+`-o` names the output, a bare argument names the input, `-` means stdin
+explicitly, and `-h` prints the usage. It refuses to write raw samples to a
+terminal, since that is a forgotten `-o` rather than something anyone wants.
+A trailing fragment shorter than one sample is reported on stderr and dropped.
+
+Compile with `-DFILTER_NO_MAIN` to leave `main` out and link the filter into
+something else.
 
 ## Generating hardware
 

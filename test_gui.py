@@ -462,27 +462,37 @@ def save_c(app, path, monkeypatch):
     return path.read_text()
 
 
-def build_and_run(tmp_path, source, samples):
-    """Compile the generated filter and push samples through it."""
+def build_c(tmp_path, source, name="filter"):
+    """Compile the generated filter, warning-free, and return the executable."""
     cc = shutil.which("cc") or shutil.which("gcc")
     if cc is None:
         pytest.skip("no C compiler available")
-    src = tmp_path / "filter.c"
-    exe = tmp_path / "filter"
+    src = tmp_path / f"{name}.c"
+    exe = tmp_path / name
     src.write_text(source)
     build = subprocess.run(
         # -ffp-contract=off keeps the compiler from fusing a multiply and an
         # add into one FMA, which rounds once instead of twice and would put
         # the C a few bits away from the same arithmetic done in numpy.
         [cc, "-std=c99", "-Wall", "-Wextra", "-pedantic", "-O2",
-         "-ffp-contract=off", "-DFILTER_MAIN", "-o", str(exe), str(src), "-lm"],
+         "-ffp-contract=off", "-o", str(exe), str(src), "-lm"],
         capture_output=True, text=True)
     assert build.returncode == 0, build.stderr
     assert build.stderr == "", build.stderr        # and without a single warning
-    run = subprocess.run([str(exe)], text=True, capture_output=True,
-                         input="\n".join(f"{v:.17g}" for v in samples))
-    assert run.returncode == 0, run.stderr
-    return np.array([float(v) for v in run.stdout.split()])
+    return exe
+
+
+def build_and_run(tmp_path, source, samples, args=(), name="filter"):
+    """Compile the generated filter and push samples through it.
+
+    Raw float64 in and out, native byte order, which is what the program reads
+    and writes -- there is no text mode any more.
+    """
+    exe = build_c(tmp_path, source, name)
+    payload = np.asarray(samples, dtype="=f8").tobytes()
+    run = subprocess.run([str(exe), *args], input=payload, capture_output=True)
+    assert run.returncode == 0, run.stderr.decode()
+    return np.frombuffer(run.stdout, dtype="=f8")
 
 
 def test_the_save_c_button_is_on_the_action_row(app):
@@ -1445,3 +1455,327 @@ def test_neither_failure_leaves_a_window_behind(tmp_path):
     path = tmp_path / "bad.json"
     path.write_text("{not json")
     assert gui.main([str(path)]) == 2
+
+
+# --------------------------------------------- the sample rate scales the bands
+
+
+def band_edges(app):
+    return [(row.vars[0].get(), row.vars[1].get()) for row in app.rows]
+
+
+def set_rate(app, rate):
+    """What committing a new sample rate in the entry does."""
+    app.fs.set(rate)
+    app._sample_rate_changed()
+
+
+def test_changing_the_rate_moves_the_band_edges(app):
+    assert band_edges(app) == [("0", "0.2"), ("0.25", "0.5")]
+    set_rate(app, 48000.0)
+    assert band_edges(app) == [("0", "9600"), ("12000", "24000")]
+
+
+def test_the_filter_itself_does_not_change(app):
+    """The whole point: the units change, the design does not."""
+    before = app.result.h.copy()
+    set_rate(app, 48000.0)
+    assert np.allclose(app.result.h, before, atol=1e-12)
+    assert app.result.fs == 48000.0
+    assert app.result.bands[1].f1 == pytest.approx(0.25 * 48000)
+
+
+def test_the_edges_come_back_when_the_rate_does(app):
+    original = band_edges(app)
+    set_rate(app, 44100.0)
+    set_rate(app, 1.0)
+    assert band_edges(app) == original
+
+
+def test_an_awkward_edge_survives_the_round_trip(app):
+    """%g at six figures would round 5925.925872 and never give 0.123456789
+    back again."""
+    app.rows[0].vars[1].set("0.123456789")
+    set_rate(app, 48000.0)
+    assert app.rows[0].vars[1].get() == "5925.925872"
+    set_rate(app, 1.0)
+    assert float(app.rows[0].vars[1].get()) == pytest.approx(0.123456789, rel=1e-12)
+
+
+def test_only_frequencies_move(app):
+    app.load_preset("Multiband")
+    gains = [(r.vars[2].get(), r.vars[3].get()) for r in app.rows]
+    weights = [(r.vars[4].get(), r.vars[5].get()) for r in app.rows]
+    set_rate(app, 48000.0)
+    assert [(r.vars[2].get(), r.vars[3].get()) for r in app.rows] == gains
+    assert [(r.vars[4].get(), r.vars[5].get()) for r in app.rows] == weights
+
+
+def test_the_iir_edges_move_and_its_dB_specs_do_not(iir):
+    sos = iir.iir_result.sos.copy()
+    rp, rs = iir.iir_rp.get(), iir.iir_rs.get()
+    set_rate(iir, 44100.0)
+    assert iir.iir_wp[0].get() == "8820"
+    assert iir.iir_ws[0].get() == "11025"
+    assert (iir.iir_rp.get(), iir.iir_rs.get()) == (rp, rs)
+    assert np.allclose(iir.iir_result.sos, sos, atol=1e-12)
+
+
+def test_the_other_mode_is_kept_in_step(app):
+    """The rate is shared, so a stale edge in the mode that is not showing
+    would be wrong the moment it was switched to."""
+    set_rate(app, 48000.0)
+    assert app.iir_wp[0].get() == "9600"
+    app.mode.set(gui.MODE_IIR)
+    app.switch_mode()
+    assert app.iir_result is not None, report_text(app)
+    assert app.iir_result.wp[0] == pytest.approx(9600.0)
+
+
+@pytest.mark.parametrize("rate", [0.0, -5.0])
+def test_a_rate_that_is_not_a_rate_leaves_the_edges_alone(app, rate):
+    before = band_edges(app)
+    baseline = app.fs_baseline
+    set_rate(app, rate)
+    assert band_edges(app) == before
+    assert app.fs_baseline == baseline      # so a later good value still works
+    set_rate(app, 2.0)
+    assert band_edges(app) == [("0", "0.4"), ("0.5", "1")]
+
+
+def test_committing_the_same_rate_twice_scales_once(app):
+    set_rate(app, 48000.0)
+    once = band_edges(app)
+    set_rate(app, 48000.0)
+    assert band_edges(app) == once
+
+
+def test_a_field_being_edited_is_left_alone(app):
+    app.rows[0].vars[1].set("")             # mid-edit, not a number yet
+    set_rate(app, 48000.0)
+    assert app.rows[0].vars[1].get() == ""
+    assert app.rows[1].vars[0].get() == "12000"   # the rest still moved
+
+
+def test_a_preset_loaded_afterwards_uses_the_new_rate(app):
+    set_rate(app, 48000.0)
+    app.load_preset("Bandpass")
+    assert band_edges(app)[0] == ("0", "5760")    # 0.12 of 48000
+
+
+def test_opening_a_design_does_not_scale_it_again(app, tmp_path, monkeypatch):
+    set_rate(app, 44100.0)
+    app.design()
+    saved = app.to_dict()
+    path = tmp_path / "rate.json"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    app.save_design()
+
+    set_rate(app, 1.0)                      # somewhere else entirely
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **kw: str(path))
+    app.open_design()
+    assert app.to_dict() == saved
+    assert app.fs_baseline == 44100.0
+    # And a change made now scales from the file's rate, not the old one.
+    set_rate(app, 88200.0)
+    assert app.rows[1].vars[0].get() == "22050"
+
+
+# --------------------------------------------- the generated program's interface
+
+
+def test_the_generated_c_is_a_program_by_default(app, tmp_path, monkeypatch):
+    """main is in unless it is asked to be left out, which is the way round a
+    generated filter is most often wanted."""
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    assert "#ifndef FILTER_NO_MAIN" in text
+    assert "FILTER_MAIN" not in text.replace("FILTER_NO_MAIN", "")
+    assert "int main(int argc, char **argv)" in text
+    # It compiles as a program with no defines at all.
+    exe = build_c(tmp_path, text)
+    assert exe.exists()
+
+
+def test_it_can_still_be_built_as_a_library(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler available")
+    src = tmp_path / "lib.c"
+    src.write_text(text)
+    build = subprocess.run(
+        [cc, "-std=c99", "-Wall", "-Wextra", "-pedantic", "-O2", "-c",
+         "-DFILTER_NO_MAIN", "-o", str(tmp_path / "lib.o"), str(src)],
+        capture_output=True, text=True)
+    assert build.returncode == 0, build.stderr
+    assert build.stderr == "", build.stderr
+
+
+def test_the_program_names_itself_after_the_file(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "my_lowpass.c", monkeypatch)
+    assert 'static const char *progname = "my_lowpass";' in text
+
+
+def test_the_program_reads_and_writes_raw_doubles(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    x = np.random.default_rng(3).standard_normal(500)
+    got = build_and_run(tmp_path, text, x)
+    assert got.dtype == np.dtype("=f8")
+    assert len(got) == len(x)
+    assert np.allclose(got, np.convolve(x, app.result.h)[:len(x)], atol=1e-12)
+
+
+def test_it_filters_a_named_file_to_a_named_file(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    exe = build_c(tmp_path, text)
+    x = np.random.default_rng(4).standard_normal(300)
+    src = tmp_path / "in.f64"
+    dst = tmp_path / "out.f64"
+    src.write_bytes(np.asarray(x, dtype="=f8").tobytes())
+
+    run = subprocess.run([str(exe), "-o", str(dst), str(src)],
+                         capture_output=True)
+    assert run.returncode == 0, run.stderr.decode()
+    got = np.frombuffer(dst.read_bytes(), dtype="=f8")
+    assert np.allclose(got, np.convolve(x, app.result.h)[:len(x)], atol=1e-12)
+
+
+def test_a_dash_means_stdin(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    x = np.arange(20, dtype=float)
+    piped = build_and_run(tmp_path, text, x)
+    dashed = build_and_run(tmp_path, text, x, args=("-",))
+    assert np.array_equal(piped, dashed)
+
+
+def test_the_help_text_explains_itself(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    exe = build_c(tmp_path, text)
+    for flag in ("-h", "--help"):
+        run = subprocess.run([str(exe), flag], capture_output=True, text=True)
+        assert run.returncode == 0
+        assert "usage:" in run.stdout
+        assert "raw 64 bit float" in run.stdout
+
+
+def test_bad_arguments_are_refused(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    exe = build_c(tmp_path, text)
+    for args, complaint in (
+            (["-o"], "needs a filename"),
+            (["--wat"], "unknown option"),
+            (["one", "two"], "only one input file"),
+            (["/nonexistent/file"], "No such file")):
+        run = subprocess.run([str(exe), *args], capture_output=True, text=True,
+                             input="")
+        assert run.returncode == 1, args
+        assert complaint in run.stderr, (args, run.stderr)
+
+
+def test_a_trailing_part_sample_is_reported_and_dropped(app, tmp_path,
+                                                        monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    exe = build_c(tmp_path, text)
+    x = np.arange(8, dtype=float)
+    payload = np.asarray(x, dtype="=f8").tobytes() + b"\x01\x02\x03"
+    run = subprocess.run([str(exe)], input=payload, capture_output=True)
+    assert run.returncode == 0
+    assert len(np.frombuffer(run.stdout, dtype="=f8")) == len(x)
+    assert b"trailing" in run.stderr
+
+
+def test_an_empty_input_is_not_an_error(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    exe = build_c(tmp_path, text)
+    run = subprocess.run([str(exe)], input=b"", capture_output=True)
+    assert run.returncode == 0
+    assert run.stdout == b""
+
+
+def test_a_block_boundary_does_not_disturb_the_filter(app, tmp_path,
+                                                      monkeypatch):
+    """It reads 4096 samples at a time; the state has to carry across."""
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    x = np.random.default_rng(5).standard_normal(10000)
+    got = build_and_run(tmp_path, text, x)
+    assert np.allclose(got, np.convolve(x, app.result.h)[:len(x)], atol=1e-12)
+
+
+# ------------------------------------------------- the magnitude plot's y range
+
+
+def spec_lowpass(app, attenuation, numtaps=41):
+    """A lowpass specified in dB, like the screenshot that reported this."""
+    app.fs.set(32000.0)
+    app._sample_rate_changed()
+    app.rows[0].vars[1].set("6400")
+    app.rows[1].vars[0].set("8000")
+    app.rows[1].vars[1].set("16000")
+    app.rows[0].vars[5].set("0.5")
+    app.rows[1].vars[5].set(str(attenuation))
+    app.numtaps.set(numtaps)
+    app.use_spec.set(True)
+    app._spec_toggled()
+    return app.ax_mag.get_ylim()
+
+
+def test_the_stopband_is_not_cut_off_the_bottom(app):
+    """Asking for 80 dB used to leave the axis at about -44 dB.
+
+    The floor came from delta, which is the *weighted* deviation: with weights
+    derived from dB specs it is essentially the passband's number and says
+    nothing about how deep the stopband goes.
+    """
+    lo, hi = spec_lowpass(app, 80)
+    achieved = 20 * np.log10(app.result.band_deviation[1])
+    requested = 20 * np.log10(app.spec_dev[1])
+    assert lo < achieved, (lo, achieved)      # the response is on the plot
+    assert lo < requested, (lo, requested)    # and so is the line it is judged by
+    assert hi >= 5.0
+
+
+def test_a_deeper_spec_takes_the_axis_deeper(app):
+    floors = [spec_lowpass(app, att)[0] for att in (40, 60, 80, 100)]
+    assert floors == sorted(floors, reverse=True)
+    assert floors[0] > floors[-1] + 40        # and by a useful amount
+
+
+def test_the_axis_follows_what_the_filter_achieves(app):
+    """More taps make the stopband deeper, and the plot has to keep up."""
+    seen = []
+    for numtaps in (41, 81, 121):
+        lo, _ = spec_lowpass(app, 80, numtaps)
+        achieved = 20 * np.log10(app.result.band_deviation[1])
+        assert lo < achieved
+        seen.append(lo)
+    assert seen == sorted(seen, reverse=True)
+
+
+def test_a_design_with_no_dB_specs_is_still_framed(app):
+    assert app.spec_dev is None
+    lo, _ = app.ax_mag.get_ylim()
+    assert lo < 20 * np.log10(app.result.band_deviation[1])
+
+
+@pytest.mark.parametrize("name", list(gui.PRESETS))
+def test_every_preset_is_framed_sensibly(app, name):
+    app.load_preset(name)
+    app.design()
+    lo, hi = app.ax_mag.get_ylim()
+    assert -220.0 <= lo <= -20.0              # never absurd, never shallow
+    assert hi >= 5.0
+    for band, dev in zip(app.result.bands, app.result.band_deviation):
+        target = max(abs(band.d1), abs(band.d2))
+        if target < 1e-12 and dev > 0:        # a stopband: it must be visible
+            assert lo < 20 * np.log10(dev)
+
+
+def test_the_noise_floor_is_inside_the_axis_when_it_is_shown(app):
+    spec_lowpass(app, 80, numtaps=81)
+    go_fixed(app, 16)
+    app.show_noise.set(True)
+    app._noise_toggled()
+    measured = app._noise_floor()
+    assert measured is not None
+    lo, _ = app.ax_mag.get_ylim()
+    assert lo < float(np.median(measured[1]))
