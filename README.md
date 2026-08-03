@@ -21,7 +21,7 @@ From a terminal it takes a design file, and answers `--help` and `--version`
 without opening a window:
 
 ```bash
-remez mydesign.json
+remez mydesign.remz
 ```
 
 ## How this is checked
@@ -34,9 +34,13 @@ the one real difference so far: `zpkToSos` was pairing the poles furthest
 which put the sections in the wrong order and gave the odd-order leftover pole
 two zeros instead of one.
 
-The reference designs come from the Python implementation, which now lives
-alongside this one in `remez_python`. Regenerate them from there if the original
-ever changes.
+The reference designs come from the Python implementation, which is in this
+repository under `python_prototype/`. Regenerate them from there if it ever
+changes:
+
+```bash
+python_prototype/venv/bin/python   # has numpy; the system python does not
+```
 
 It also caught an off-by-one in the iteration count: a C-style `for` leaves the
 counter one past the cap where Python's `range(1, maxiter + 1)` leaves it at the
@@ -67,9 +71,9 @@ done so nobody "fixes" them.
 | module | state |
 | --- | --- |
 | `fir_core.dart` | **complete.** All four linear-phase types, multiband, weights, inverse-f weighting, reference scaling for long filters. Matches the Python to 1e-9 per tap on every reference design |
-| `fixed_point.dart` | **complete** for taps; the SOS path waits on the elliptic model below |
+| `fixed_point.dart` | **complete.** Taps and biquad sections, with the binary point placed automatically |
 | `datapath.dart` | **complete.** chain / tree / MAC, folding, saturating arithmetic, the measured noise floor |
-| `iir_core.dart` | **partial** — see the table below |
+| `iir_core.dart` | **complete.** All four approximations across all four responses |
 | `controller.dart`, `plots.dart`, `main.dart` | the app: FIR and IIR design, magnitude, weighted error and impulse plots, the arithmetic panel, the report, all eight presets, the grid density and iteration cap, and the dB Spec column that derives the band weights |
 | `design_view.dart` | **complete.** The filter as built: the biquad cascade in transposed direct form II, the FIR as a tapped delay line with the middle elided past thirteen taps |
 | `c_export.dart` | **complete.** Library and program in one file, raw f64 stdin to stdout |
