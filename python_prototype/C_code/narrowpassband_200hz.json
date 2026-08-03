@@ -1,0 +1,77 @@
+{
+  "arithmetic": {
+    "auto_frac": true,
+    "fixed_coeffs": true,
+    "folded": false,
+    "frac_bits": 22,
+    "headroom": 4,
+    "kind": "float",
+    "structure": "tree",
+    "testbench": true,
+    "word_bits": 16
+  },
+  "display": {
+    "folded_panels": [],
+    "log_scale": true,
+    "show_ext": true,
+    "show_noise": false,
+    "show_spec": true,
+    "view": "Plot view"
+  },
+  "fir": {
+    "bands": [
+      [
+        0.0,
+        140.0,
+        0.0,
+        0.0,
+        10.0,
+        50.0,
+        false
+      ],
+      [
+        170.0,
+        230.0,
+        1.0,
+        1.0,
+        1.0,
+        0.5,
+        false
+      ],
+      [
+        260.0,
+        16000.0,
+        0.0,
+        0.0,
+        10.0,
+        50.0,
+        false
+      ]
+    ],
+    "grid_density": 16,
+    "maxiter": 60,
+    "numtaps": 1601,
+    "symmetry": "symmetric",
+    "use_spec": true
+  },
+  "format": "remez-filter-design",
+  "fs": 32000.0,
+  "iir": {
+    "approximation": "Elliptic",
+    "auto_order": true,
+    "order": 6,
+    "response": "Lowpass",
+    "rp": 0.5,
+    "rs": 60.0,
+    "wp": [
+      "0.2",
+      "0.4"
+    ],
+    "ws": [
+      "0.25",
+      "0.45"
+    ]
+  },
+  "mode": "FIR \u2014 Remez exchange",
+  "version": 1
+}

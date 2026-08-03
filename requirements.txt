@@ -1,6 +1,0 @@
-numpy>=1.22
-matplotlib>=3.6
-
-# tests only
-pytest>=7
-scipy>=1.9

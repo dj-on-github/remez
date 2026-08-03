@@ -1,0 +1,1781 @@
+"""GUI-level checks.
+
+These drive the real Tk widgets (a window is created but never entered into
+mainloop), so they exercise the whole path from the entry fields through the
+design to the rendered figure.
+"""
+
+import os
+import shutil
+import subprocess
+
+import numpy as np
+import pytest
+
+tk = pytest.importorskip("tkinter")
+import iir_core as ii  # noqa: E402
+import fir_core as rz  # noqa: E402
+import remez as gui  # noqa: E402
+
+
+@pytest.fixture
+def app():
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display available")
+    root.withdraw()
+    a = gui.RemezApp(root)
+    yield a
+    root.destroy()
+
+
+@pytest.fixture
+def iir(app):
+    app.mode.set(gui.MODE_IIR)
+    app.switch_mode()
+    return app
+
+
+def report_text(app):
+    return app.report.get("1.0", "end")
+
+
+@pytest.mark.parametrize("name", list(gui.PRESETS))
+def test_every_preset_designs(app, name):
+    app.load_preset(name)
+    app.design()
+    assert app.result is not None, report_text(app)
+    assert app.result.converged
+    assert np.all(np.isfinite(app.result.h))
+    assert "did not converge" not in report_text(app)
+
+
+def test_default_lowpass_is_equiripple(app):
+    res = app.result
+    e = res.extremal_e
+    assert np.all(np.sign(e[:-1]) * np.sign(e[1:]) < 0)
+    assert np.allclose(np.abs(e), abs(res.delta), rtol=1e-6)
+
+
+def test_editing_a_field_changes_the_filter(app):
+    before = app.result.h.copy()
+    app.rows[0].vars[1].set("0.1")        # narrow the passband
+    app.design()
+    assert not np.allclose(before, app.result.h)
+
+
+def test_taps_field_drives_the_length(app):
+    app.numtaps.set(64)
+    app.design()
+    assert app.result.numtaps == 64
+    assert app.result.ftype == 2           # even length, symmetric
+
+
+def test_sample_rate_in_hz(app):
+    app.fs.set(48000.0)
+    app.load_preset("Lowpass")
+    app.design()
+    assert app.result is not None, report_text(app)
+    assert app.result.bands[0].f2 == pytest.approx(0.2 * 48000)
+    normalised = rz.design(app.result.numtaps,
+                           [rz.Band(0, .2, 1., w1=1.), rz.Band(.25, .5, 0., w1=10.)])
+    assert np.allclose(app.result.h, normalised.h, atol=1e-9)
+
+
+def test_add_and_remove_bands(app):
+    n = len(app.rows)
+    app.add_row((0.3, 0.4, 0.0, 0.0, 1.0, 40.0, False))
+    assert len(app.rows) == n + 1
+    app.remove_row(app.rows[-1])
+    assert len(app.rows) == n
+    # The last band cannot be removed, so a design is always possible.
+    while len(app.rows) > 1:
+        app.remove_row(app.rows[-1])
+    app.remove_row(app.rows[0])
+    assert len(app.rows) == 1
+
+
+def test_spec_mode_sets_weights_and_checks_them(app):
+    app.load_preset("Lowpass")
+    app.use_spec.set(True)
+    app._spec_toggled()
+    assert app.result is not None, report_text(app)
+    # 0.5 dB passband ripple against 50 dB stopband attenuation.
+    dp, ds = app.spec_dev
+    assert dp == pytest.approx((10 ** 0.025 - 1) / (10 ** 0.025 + 1), rel=1e-9)
+    assert ds == pytest.approx(10 ** -2.5, rel=1e-9)
+    assert app.result.bands[1].w1 / app.result.bands[0].w1 == pytest.approx(dp / ds)
+    assert "spec check" in report_text(app)
+
+
+def test_spec_mode_reports_a_miss_and_suggests_taps(app):
+    app.load_preset("Lowpass")
+    app.numtaps.set(11)                    # far too short for 50 dB
+    app.use_spec.set(True)
+    app._spec_toggled()
+    text = report_text(app)
+    assert "MISSED" in text
+    assert "try about" in text
+
+
+def test_bad_input_is_reported_not_raised(app):
+    app.rows[0].vars[0].set("banana")
+    app.design()
+    assert app.result is None
+    assert "Cannot design" in report_text(app)
+    app.rows[0].vars[0].set("0")           # and it recovers
+    app.design()
+    assert app.result is not None
+
+
+def test_overlapping_bands_are_reported(app):
+    app.rows[1].vars[0].set("0.1")         # stopband now starts inside passband
+    app.design()
+    assert app.result is None
+    assert "overlaps" in report_text(app)
+
+
+def test_differentiator_uses_inverse_f_weighting(app):
+    app.load_preset("Differentiator")
+    app.design()
+    assert app.result is not None, report_text(app)
+    assert app.result.bands[0].weight_kind == "inv_f"
+    assert app.result.symmetry == "antisymmetric"
+    f = np.linspace(0.05, 0.44, 500)
+    a = rz.amplitude_response(app.result.h, 2 * np.pi * f, "antisymmetric")
+    assert np.max(np.abs(a - 2 * np.pi * f) / (2 * np.pi * f)) < 0.02
+
+
+def test_plot_switches_between_db_and_linear(app):
+    app.log_scale.set(True)
+    app.redraw()
+    assert "dB" in app.ax_mag.get_ylabel()
+    app.log_scale.set(False)
+    app.redraw()
+    assert app.ax_mag.get_ylabel() == "amplitude"
+
+
+def test_error_curve_is_not_joined_across_transition_bands(app):
+    slices = gui.RemezApp._segment_slices(app.result)
+    assert len(slices) == len(app.result.bands)
+
+
+# ------------------------------------------------------------------ IIR mode
+
+
+def test_the_mode_selector_swaps_panels_and_axes(app):
+    assert not app.is_iir()
+    assert app.fir_panel.winfo_ismapped() or app.fir_panel.grid_info()
+    assert app.iir_panel.grid_info() == {}
+    fir_axes = list(app.fig.axes)
+
+    app.mode.set(gui.MODE_IIR)
+    app.switch_mode()
+    assert app.is_iir()
+    assert app.fir_panel.grid_info() == {}
+    assert app.iir_panel.grid_info() != {}
+    assert app.iir_result is not None, report_text(app)
+    assert not any(ax in fir_axes for ax in app.fig.axes)
+    assert str(app.ext_check["state"]) == "disabled"
+
+    app.mode.set(gui.MODE_FIR)
+    app.switch_mode()
+    assert app.result is not None, report_text(app)
+    assert str(app.ext_check["state"]) == "normal"
+
+
+@pytest.mark.parametrize("name", list(gui.IIR_PRESETS))
+def test_every_iir_preset_designs(iir, name):
+    iir.load_iir_preset(name)
+    iir.design()
+    res = iir.iir_result
+    assert res is not None, report_text(iir)
+    assert res.stable and res.meets_spec
+    assert np.all(np.isfinite(res.sos))
+    assert "MISSED" not in report_text(iir)
+
+
+def test_automatic_order_fills_in_the_spinbox(iir):
+    iir.load_iir_preset("Elliptic lowpass")
+    iir.design()
+    assert iir.auto_order.get()
+    assert str(iir.order_spin["state"]) == "disabled"
+    assert iir.iir_order.get() == iir.iir_result.order == iir.iir_result.order_estimate
+
+
+def test_a_manual_order_is_used_and_reported(iir):
+    iir.load_iir_preset("Elliptic lowpass")
+    iir.design()
+    n = iir.iir_result.order
+    iir.auto_order.set(False)
+    iir._auto_order_toggled()
+    assert str(iir.order_spin["state"]) == "normal"
+    iir.iir_order.set(n - 2)
+    iir.design()
+    assert iir.iir_result.order == n - 2
+    assert not iir.iir_result.meets_spec
+    text = report_text(iir)
+    assert "MISSED" in text
+    assert f"raise the order to {n}" in text
+
+
+def test_editing_an_edge_changes_the_iir_filter(iir):
+    before = iir.iir_result.sos.copy()
+    iir.iir_wp[0].set("0.1")
+    iir.design()
+    assert iir.iir_result.sos.shape != before.shape or \
+        not np.allclose(iir.iir_result.sos, before)
+    assert iir.iir_result.wp == (0.1,)
+
+
+def test_band_responses_enable_the_upper_edge_fields(iir):
+    lo, hi = iir.edge_entries["Passband edge"]
+    assert str(hi["state"]) == "disabled"
+    iir.response.set("Bandpass")
+    iir._edge_fields_for_response()
+    assert str(hi["state"]) == "normal"
+    assert str(lo["state"]) == "normal"
+    iir.response.set("Highpass")
+    iir._edge_fields_for_response()
+    assert str(hi["state"]) == "disabled"
+
+
+def test_approximations_all_design_from_the_same_spec(iir):
+    iir.load_iir_preset("Elliptic lowpass")
+    orders = {}
+    for name in gui.APPROX_LABELS:
+        iir.approximation.set(name)
+        iir.design()
+        assert iir.iir_result is not None, (name, report_text(iir))
+        orders[name] = iir.iir_result.order
+    # the whole point of the elliptic design is that it needs the fewest poles
+    assert orders["Elliptic"] < orders["Chebyshev I"] < orders["Butterworth"]
+
+
+def test_iir_sample_rate_in_hz(iir):
+    iir.fs.set(48000.0)
+    iir.load_iir_preset("Elliptic lowpass")
+    iir.design()
+    assert iir.iir_result is not None, report_text(iir)
+    assert iir.iir_result.wp == (0.2 * 48000,)
+    normalised = ii.design("lowpass", "elliptic", wp=(0.2,), ws=(0.25,),
+                           rp=0.5, rs=60.0)
+    assert np.allclose(iir.iir_result.sos, normalised.sos)
+
+
+def test_bad_iir_input_is_reported_not_raised(iir):
+    iir.iir_wp[0].set("banana")
+    iir.design()
+    assert iir.iir_result is None
+    assert "Cannot design" in report_text(iir)
+    iir.iir_wp[0].set("0.2")               # and it recovers
+    iir.design()
+    assert iir.iir_result is not None
+
+
+def test_overlapping_iir_edges_are_reported(iir):
+    iir.iir_ws[0].set("0.1")               # stopband edge below the passband edge
+    iir.design()
+    assert iir.iir_result is None
+    assert "stopband edge must be above" in report_text(iir)
+
+
+def test_iir_plot_switches_between_db_and_linear(iir):
+    iir.log_scale.set(True)
+    iir.redraw()
+    assert "dB" in iir.ax_imag.get_ylabel()
+    iir.log_scale.set(False)
+    iir.redraw()
+    assert iir.ax_imag.get_ylabel() == "magnitude"
+
+
+def test_iir_pole_zero_panel_is_drawn(iir):
+    iir.load_iir_preset("Butterworth lowpass")
+    iir.design()
+    assert iir.ax_pz.get_aspect() == 1.0
+    assert f"{iir.iir_result.max_pole_radius:.4f}" in iir.ax_pz.get_title()
+    # all the zeros of a Butterworth sit on top of each other at Nyquist
+    counts = gui.RemezApp._multiplicities(iir.iir_result.z)
+    assert len(counts) == 1 and counts[0][1] == iir.iir_result.degree
+
+
+def test_iir_exports(iir, tmp_path, monkeypatch):
+    csv = tmp_path / "sos.csv"
+    header = tmp_path / "sos.h"
+    png = tmp_path / "iir.png"
+
+    def choose(path):
+        monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                            lambda **kw: str(path))
+
+    choose(csv)
+    iir.save_coefficients()
+    choose(header)
+    iir.save_coefficients()
+    choose(png)
+    iir.save_plot()
+
+    res = iir.iir_result
+    rows = [r for r in csv.read_text().strip().splitlines()
+            if not r.startswith(("#", "section,"))]
+    assert len(rows) == len(res.sos)
+    values = np.array([[float(v) for v in r.split(",")[1:]] for r in rows])
+    assert np.allclose(values, res.sos, atol=1e-15)
+
+    text = header.read_text()
+    assert f"#define IIR_SECTIONS {len(res.sos)}" in text
+    assert text.count("},") == len(res.sos)
+
+    assert png.exists() and os.path.getsize(png) > 5000
+
+
+# --------------------------------------------------------------- design view
+
+
+def diagram_text(app):
+    return [t.get_text() for t in app.ax_design.texts]
+
+
+def test_the_view_selector_swaps_between_plots_and_the_diagram(iir):
+    assert not iir.is_design()
+    assert len(iir.fig.axes) > 1
+
+    iir.view.set(gui.VIEW_DESIGN)
+    iir.switch_view()
+    assert iir.is_design()
+    assert len(iir.fig.axes) == 1
+    assert not iir.ax_design.axison
+    assert "structure" in iir.view_hint["text"]
+
+    iir.view.set(gui.VIEW_PLOT)
+    iir.switch_view()
+    assert not iir.is_design()
+    assert "dB" in iir.ax_imag.get_ylabel()
+    assert iir.view_hint["text"] == ""
+
+
+def test_the_iir_diagram_has_one_biquad_per_section(iir):
+    iir.load_iir_preset("Elliptic bandpass")
+    iir.design()
+    res = iir.iir_result
+    iir.view.set(gui.VIEW_DESIGN)
+    iir.switch_view()
+
+    text = diagram_text(iir)
+    # two unit delays and three adders per transposed direct form II section
+    assert text.count("z⁻¹") == 2 * len(res.sos)
+    assert text.count("+") == 3 * len(res.sos)
+    for i in range(len(res.sos)):
+        assert any(t.startswith(f"section {i} ") for t in text)
+    # the sections are chained input to output
+    assert "x[n]" in text and "y[n]" in text
+    for i in range(1, len(res.sos)):
+        assert text.count(f"w{i}[n]") == 2      # output of one, input of the next
+
+
+def test_the_iir_diagram_shows_the_real_coefficients(iir):
+    iir.load_iir_preset("Elliptic lowpass")
+    iir.design()
+    s = iir.iir_result.sos[0]
+    iir.view.set(gui.VIEW_DESIGN)
+    iir.switch_view()
+    text = diagram_text(iir)
+    assert f"b0 = {s[0]:+.6g}" in text
+    assert f"−a1 = {-s[4]:+.6g}" in text
+    # a first-order section arrives padded, and says so rather than hiding it
+    assert s[2] == 0.0 and "b2 = +0" in text
+
+
+def test_the_diagram_follows_the_mode(iir):
+    iir.view.set(gui.VIEW_DESIGN)
+    iir.switch_view()
+    assert any("biquad" in t for t in diagram_text(iir))
+    iir.mode.set(gui.MODE_FIR)
+    iir.switch_mode()
+    assert iir.is_design()
+    assert any("direct form" in t for t in diagram_text(iir))
+
+
+def test_the_fir_diagram_draws_every_tap_when_it_can(app):
+    app.numtaps.set(11)
+    app.design()
+    app.view.set(gui.VIEW_DESIGN)
+    app.switch_view()
+    text = diagram_text(app)
+    assert text.count("z⁻¹") == 10
+    assert [f"h{k}" for k in range(11)] == [t for t in text if t[:1] == "h" and
+                                            t[1:].isdigit()]
+    assert f"{app.result.h[0]:+.6g}" in text
+    assert any("folded form needs only 6" in t for t in text)
+
+
+def test_a_long_fir_says_which_taps_it_left_out(app):
+    app.numtaps.set(41)
+    app.design()
+    app.view.set(gui.VIEW_DESIGN)
+    app.switch_view()
+    text = diagram_text(app)
+    assert text.count("⋯") == 2               # one break on each rail
+    assert "h6" not in text and "h34" not in text
+    assert any("taps 6 … 34 are not drawn" in t for t in text)
+
+
+def test_the_diagram_can_be_saved(iir, tmp_path, monkeypatch):
+    iir.view.set(gui.VIEW_DESIGN)
+    iir.switch_view()
+    out = tmp_path / "structure.pdf"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(out))
+    iir.save_plot()
+    assert out.exists() and os.path.getsize(out) > 2000
+
+
+def test_a_failed_design_does_not_break_the_design_view(iir):
+    iir.view.set(gui.VIEW_DESIGN)
+    iir.switch_view()
+    iir.iir_wp[0].set("banana")
+    iir.design()
+    assert iir.iir_result is None
+    assert "Cannot design" in report_text(iir)
+    iir.iir_wp[0].set("0.2")
+    iir.design()
+    assert iir.iir_result is not None
+    assert any("biquad" in t for t in diagram_text(iir))
+
+
+# ------------------------------------------------------------- C source export
+
+
+def buttons(widget):
+    """Every button text under ``widget``, however deeply nested."""
+    out = []
+    for child in widget.winfo_children():
+        if isinstance(child, gui.ttk.Button):
+            out.append(child["text"])
+        out.extend(buttons(child))
+    return out
+
+
+def save_c(app, path, monkeypatch):
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    app.save_c_source()
+    return path.read_text()
+
+
+def build_c(tmp_path, source, name="filter"):
+    """Compile the generated filter, warning-free, and return the executable."""
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler available")
+    src = tmp_path / f"{name}.c"
+    exe = tmp_path / name
+    src.write_text(source)
+    build = subprocess.run(
+        # -ffp-contract=off keeps the compiler from fusing a multiply and an
+        # add into one FMA, which rounds once instead of twice and would put
+        # the C a few bits away from the same arithmetic done in numpy.
+        [cc, "-std=c99", "-Wall", "-Wextra", "-pedantic", "-O2",
+         "-ffp-contract=off", "-o", str(exe), str(src), "-lm"],
+        capture_output=True, text=True)
+    assert build.returncode == 0, build.stderr
+    assert build.stderr == "", build.stderr        # and without a single warning
+    return exe
+
+
+def build_and_run(tmp_path, source, samples, args=(), name="filter"):
+    """Compile the generated filter and push samples through it.
+
+    Raw float64 in and out, native byte order, which is what the program reads
+    and writes -- there is no text mode any more.
+    """
+    exe = build_c(tmp_path, source, name)
+    payload = np.asarray(samples, dtype="=f8").tobytes()
+    run = subprocess.run([str(exe), *args], input=payload, capture_output=True)
+    assert run.returncode == 0, run.stderr.decode()
+    return np.frombuffer(run.stdout, dtype="=f8")
+
+
+def test_the_save_c_button_is_on_the_action_row(app):
+    assert "Save C…" in buttons(app.root)
+
+
+def test_save_c_declares_the_requested_interface(iir, tmp_path, monkeypatch):
+    text = save_c(iir, tmp_path / "iir.c", monkeypatch)
+    assert "typedef struct {" in text and "} t_ctx;" in text
+    assert "int init_filter(t_ctx *ctx)" in text
+    assert "double process_sample(double sample, t_ctx *ctx)" in text
+    assert "void free_filter(t_ctx *ctx)" in text
+    assert "calloc(" in text                       # it allocates its own state
+    assert f"#define FILTER_SECTIONS {len(iir.iir_result.sos)}" in text
+
+
+def test_save_c_in_fir_mode_writes_the_taps(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    assert f"#define FILTER_TAPS {app.result.numtaps}" in text
+    assert "double process_sample(double sample, t_ctx *ctx)" in text
+    assert f"{app.result.h[0]: .17g}," in text
+
+
+def test_save_c_does_nothing_if_the_dialog_is_cancelled(iir, tmp_path, monkeypatch):
+    target = tmp_path / "nothing.c"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: "")
+    iir.save_c_source()
+    assert not target.exists()
+
+
+def test_the_generated_iir_c_filters_exactly_as_the_designer_does(
+        iir, tmp_path, monkeypatch):
+    iir.load_iir_preset("Elliptic bandpass")
+    iir.design()
+    source = save_c(iir, tmp_path / "iir.c", monkeypatch)
+    x = np.random.default_rng(3).standard_normal(300)
+    got = build_and_run(tmp_path, source, x)
+    assert len(got) == len(x)
+    # the same transposed direct form II in the same order: bit for bit
+    assert np.array_equal(got, ii.sos_filter(iir.iir_result.sos, x))
+
+
+def test_the_generated_fir_c_filters_as_designed(app, tmp_path, monkeypatch):
+    source = save_c(app, tmp_path / "fir.c", monkeypatch)
+    x = np.random.default_rng(4).standard_normal(300)
+    got = build_and_run(tmp_path, source, x)
+    assert np.allclose(got, np.convolve(x, app.result.h)[:len(x)], atol=1e-12)
+
+
+def test_exports(app, tmp_path, monkeypatch):
+    csv = tmp_path / "coeffs.csv"
+    header = tmp_path / "coeffs.h"
+    png = tmp_path / "plot.png"
+
+    def choose(path):
+        monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                            lambda **kw: str(path))
+
+    choose(csv)
+    app.save_coefficients()
+    choose(header)
+    app.save_coefficients()
+    choose(png)
+    app.save_plot()
+
+    rows = csv.read_text().strip().splitlines()
+    assert rows[-1].startswith(str(app.result.numtaps - 1) + ",")
+    values = [float(r.split(",")[1]) for r in rows if not r.startswith(("#", "n,"))]
+    assert np.allclose(values, app.result.h, atol=1e-15)
+
+    text = header.read_text()
+    assert f"#define FIR_TAPS {app.result.numtaps}" in text
+    assert text.count(",") >= app.result.numtaps
+
+    assert png.exists() and png.stat().st_size > 0
+    assert os.path.getsize(png) > 5000
+
+
+# ------------------------------------------------------- fixed point arithmetic
+
+
+def go_fixed(app, bits=None, frac=None):
+    """Switch to fixed point, optionally forcing the format."""
+    app.arith.set(gui.ARITH_FIXED)
+    if bits is not None:
+        app.word_bits.set(bits)
+    if frac is not None:
+        app.auto_frac.set(False)
+        app.frac_bits.set(frac)
+    app._arith_changed()
+    return app.fixed
+
+
+def test_floating_point_is_the_default_and_quantizes_nothing(app):
+    assert app.arith.get() == gui.ARITH_FLOAT
+    assert app.fixed is None
+    assert app.eff is app.result
+    assert str(app.word_bits_widget["state"]) == "disabled"
+
+
+def test_fixed_point_rounds_the_taps_and_says_so(app):
+    q = go_fixed(app, 8)
+    assert q is not None and q.bits == 8
+    assert app.eff is not app.result
+    assert np.array_equal(app.eff.h, q.values)
+    assert np.array_equal(q.values, q.ints * 2.0 ** -q.frac_bits)
+    assert not np.allclose(app.eff.h, app.result.h)
+    assert q.qformat in app.arith_status.get()
+    assert q.qformat in report_text(app)
+
+
+def test_the_word_length_controls_wake_up_with_fixed_point(app):
+    assert str(app.word_bits_widget["state"]) == "disabled"
+    go_fixed(app, 12)
+    assert str(app.word_bits_widget["state"]) == "normal"
+    app.arith.set(gui.ARITH_FLOAT)
+    app._arith_changed()
+    assert str(app.word_bits_widget["state"]) == "disabled"
+    assert app.fixed is None
+
+
+def test_the_binary_point_spinbox_follows_the_automatic_choice(app):
+    q = go_fixed(app, 16)
+    assert app.auto_frac.get()
+    assert app.frac_bits.get() == q.frac_bits
+    assert str(app.frac_spin["state"]) == "disabled"
+    # Taking it over by hand is honoured.
+    forced = go_fixed(app, 16, frac=q.frac_bits - 3)
+    assert forced.frac_bits == q.frac_bits - 3
+    assert str(app.frac_spin["state"]) == "normal"
+
+
+def test_narrower_words_cost_stopband_attenuation(app):
+    ideal = app.result.band_deviation[1]
+    floors = []
+    for bits in (8, 12, 16):
+        go_fixed(app, bits)
+        floors.append(app.eff.band_deviation[1])
+    assert floors[0] > floors[1] > floors[2] >= ideal * 0.999
+    assert floors[0] > 2 * ideal
+
+
+def test_the_report_shows_what_rounding_cost(app):
+    go_fixed(app, 8)
+    text = report_text(app)
+    assert "cost of rounding, per band" in text
+    assert "as built, after rounding the taps" in text
+    assert "narrowest that meets the spec" in text
+    # The coefficient listing gains the integers actually stored.
+    assert str(int(app.fixed.ints[0])) in text
+
+
+def test_a_forced_binary_point_that_saturates_is_flagged(app):
+    q = go_fixed(app, 8, frac=12)         # far too far left for these taps
+    assert q.saturated > 0
+    assert "saturated" in app.arith_status.get()
+    assert "saturated" in report_text(app)
+
+
+def test_quantization_survives_a_redesign(app):
+    go_fixed(app, 10)
+    app.numtaps.set(51)
+    app.design()                          # a fresh design, still fixed point
+    assert app.fixed is not None
+    assert app.result.numtaps == 51
+    assert app.eff.h.size == 51
+    assert np.array_equal(app.eff.h, app.fixed.values)
+
+
+def test_switching_arithmetic_does_not_redesign(app):
+    before = app.result
+    go_fixed(app, 12)
+    assert app.result is before           # the same design object, re-rounded
+    app.arith.set(gui.ARITH_FLOAT)
+    app._arith_changed()
+    assert app.result is before
+    assert app.eff is before
+
+
+def test_the_plot_shows_the_ideal_response_alongside(app):
+    app.redraw()
+    labels = [ln.get_label() for ln in app.ax_mag.get_lines()]
+    assert not any("ideal" in str(x) for x in labels)
+    go_fixed(app, 8)
+    labels = [ln.get_label() for ln in app.ax_mag.get_lines()]
+    assert any("ideal" in str(x) for x in labels)
+    assert any("8-bit" in str(x) for x in labels)
+
+
+def test_a_bad_word_length_is_reported_not_raised(app):
+    app.arith.set(gui.ARITH_FIXED)
+    app.word_bits.set(1)                  # below the minimum
+    app._arith_changed()
+    assert app.fixed is None
+    assert app.eff is app.result          # falls back to the design itself
+    assert "not quantized" in app.arith_status.get()
+
+
+def test_fixed_point_applies_to_the_iir_sections_too(iir):
+    q = go_fixed(iir, 10)
+    assert q.ints.shape == iir.iir_result.sos.shape
+    assert np.all(q.values[:, 3] == 1.0)              # a0 left alone
+    assert np.array_equal(iir.eff.sos, q.values)
+    assert not np.allclose(iir.eff.sos, iir.iir_result.sos)
+    text = report_text(iir)
+    assert q.qformat in text
+    assert "passband ripple" in text
+
+
+def test_rounding_moves_the_iir_poles(iir):
+    before = iir.iir_result.max_pole_radius
+    go_fixed(iir, 8)
+    assert iir.eff.max_pole_radius != before
+    assert f"was {before:.6f}" in report_text(iir)
+    labels = [ln.get_label() for ln in iir.ax_pz.get_lines()]
+    assert any("before rounding" in str(x) for x in labels)
+
+
+def test_an_unstable_quantized_iir_is_called_out(iir):
+    # Narrow band, high order, poles hard against the unit circle.
+    iir.response.set("Lowpass")
+    iir.iir_wp[0].set("0.02")
+    iir.iir_ws[0].set("0.03")
+    iir.iir_rp.set("0.1")
+    iir.iir_rs.set("80")
+    iir.design()
+    assert iir.iir_result.stable
+    go_fixed(iir, 8)
+    assert not iir.eff.stable
+    text = report_text(iir)
+    assert "UNSTABLE" in text
+    assert "outside the unit circle" in text
+
+
+def test_exports_carry_the_integers_and_the_format(app, tmp_path, monkeypatch):
+    go_fixed(app, 12)
+    csv = tmp_path / "q.csv"
+    header = tmp_path / "q.h"
+    source = tmp_path / "q.c"
+    for path in (csv, header, source):
+        monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                            lambda p=path, **kw: str(p))
+        app.save_c_source() if path.suffix == ".c" else app.save_coefficients()
+
+    text = csv.read_text()
+    assert f"Q{app.fixed.int_bits}.{app.fixed.frac_bits}" in text
+    rows = [r for r in text.splitlines() if not r.startswith(("#", "n,"))]
+    assert [int(r.split(",")[2]) for r in rows] == [int(v) for v in app.fixed.ints]
+    # The exported doubles are the rounded ones, not the design's.
+    assert np.allclose([float(r.split(",")[1]) for r in rows], app.eff.h, atol=0)
+
+    head = header.read_text()
+    assert f"#define FIR_FRAC_BITS {app.fixed.frac_bits}" in head
+    assert "fir_coeffs_q" in head
+
+    c = source.read_text()
+    assert "fixed point" in c
+    assert f"{app.eff.h[0]: .17g}" in c
+
+
+def test_the_generated_c_runs_the_rounded_taps(app, tmp_path, monkeypatch):
+    go_fixed(app, 8)
+    source = save_c(app, tmp_path / "q.c", monkeypatch)
+    x = np.random.default_rng(5).standard_normal(200)
+    got = build_and_run(tmp_path, source, x)
+    assert np.allclose(got, np.convolve(x, app.eff.h)[:len(x)], atol=1e-12)
+    # and that is measurably not the unrounded design
+    assert not np.allclose(got, np.convolve(x, app.result.h)[:len(x)], atol=1e-9)
+
+
+def test_the_passband_panel_keeps_a_shifted_curve_in_frame(iir):
+    iir.load_iir_preset("Elliptic lowpass")
+    iir.design()
+    go_fixed(iir, 10)
+    lo, hi = iir.ax_idetail.get_ylim()
+    curves = [ln.get_ydata() for ln in iir.ax_idetail.get_lines()
+              if len(ln.get_ydata()) > 2]
+    assert curves, "the passband response was not drawn"
+    shown = np.concatenate(curves)
+    shown = shown[np.isfinite(shown)]
+    assert shown.min() >= lo and shown.max() <= hi
+    assert hi > 0.8 * iir.eff.rp                 # the spec lines stay visible too
+
+
+def test_a_gain_shift_from_rounding_is_reported(iir):
+    iir.load_iir_preset("Elliptic lowpass")
+    iir.design()
+    go_fixed(iir, 10)
+    shift = gui.RemezApp._passband_gain_shift(iir.iir_result, iir.eff)
+    assert abs(shift) > 0.1                      # this one moves about a dB
+    assert "passband gain" in report_text(iir)
+    assert f"{shift:+.3g} dB" in report_text(iir)
+
+
+def test_no_gain_shift_is_claimed_in_floating_point(iir):
+    assert gui.RemezApp._passband_gain_shift(iir.iir_result,
+                                             iir.iir_result) == pytest.approx(0.0)
+    assert "passband gain" not in report_text(iir)
+
+
+# --------------------------------------------------- SystemVerilog generation
+
+
+def generate_sv(app, path, monkeypatch):
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                        lambda **kw: str(path))
+    app.save_sv_source()
+    return path.read_text() if path.exists() else ""
+
+
+def button_labels(widget):
+    """Every button label below a widget, at whatever depth it sits."""
+    out = []
+    for child in widget.winfo_children():
+        if child.winfo_class() == "TButton":
+            out.append(str(child.cget("text")))
+        out += button_labels(child)
+    return out
+
+
+def test_the_action_buttons_are_all_there(app):
+    labels = button_labels(app.root)
+    for wanted in ("Design", "Save plot", "Open design", "Save design",
+                   "Save coefficients", "Save C", "Generate SV",
+                   "Generate VHDL"):
+        assert any(wanted in t for t in labels), (wanted, labels)
+
+
+def test_headroom_and_fixed_coefficients_default_sensibly(app):
+    assert app.headroom.get() == 2
+    assert app.fixed_coeffs.get() is True
+    assert str(app.headroom_spin["state"]) == "disabled"      # float mode
+    go_fixed(app, 12)
+    assert str(app.headroom_spin["state"]) == "normal"
+
+
+def test_the_status_line_reports_the_rtl_datapath(app):
+    go_fixed(app, 12)
+    app.headroom.set(5)
+    app._arith_changed()
+    text = app.arith_status.get()
+    assert "RTL datapath 17 bits" in text
+    assert "built in" in text
+    app.fixed_coeffs.set(False)
+    app._arith_changed()
+    assert "on a port" in app.arith_status.get()
+
+
+def test_generating_in_floating_point_is_refused_with_a_dialog(app, monkeypatch,
+                                                              tmp_path):
+    shown = []
+    monkeypatch.setattr(gui.messagebox, "showerror",
+                        lambda title, msg: shown.append((title, msg)))
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                        lambda **kw: str(tmp_path / "no.sv"))
+    app.save_sv_source()
+    assert shown and "Fixed point" in shown[0][1]
+    assert not (tmp_path / "no.sv").exists()
+
+
+def test_the_generated_fir_names_its_modules_after_the_file(app, tmp_path,
+                                                            monkeypatch):
+    go_fixed(app, 12)
+    src = generate_sv(app, tmp_path / "my_lowpass.sv", monkeypatch)
+    assert "module my_lowpass #(" in src
+    assert "module my_lowpass_mul" in src
+    assert f"parameter int NTAPS    = {app.result.numtaps}," in src
+    assert f"parameter int WCOEF    = {app.fixed.bits}," in src
+    assert f"parameter int FRAC     = {app.fixed.frac_bits}," in src
+    assert f"parameter int HEADROOM = {app.headroom.get()}," in src
+
+
+def test_the_headroom_setting_reaches_the_rtl(app, tmp_path, monkeypatch):
+    go_fixed(app, 10)
+    app.headroom.set(6)
+    app._arith_changed()
+    src = generate_sv(app, tmp_path / "h6.sv", monkeypatch)
+    assert "parameter int HEADROOM = 6," in src
+    assert "Datapath      16 bits = 10 + 6 headroom" in src
+
+
+def test_the_checkbox_switches_the_coefficient_port(app, tmp_path, monkeypatch):
+    go_fixed(app, 12)
+    built_in = generate_sv(app, tmp_path / "a.sv", monkeypatch)
+    assert "coeff," not in built_in
+    assert ".FIXED(1'b1)" in built_in
+
+    app.fixed_coeffs.set(False)
+    app._arith_changed()
+    ported = generate_sv(app, tmp_path / "b.sv", monkeypatch)
+    assert "input  wire signed [NCOEF*WCOEF-1:0] coeff," in ported
+    assert ".FIXED(1'b0)" in ported
+
+
+def test_the_generated_iir_is_a_biquad_cascade(iir, tmp_path, monkeypatch):
+    go_fixed(iir, 16)
+    src = generate_sv(iir, tmp_path / "ell.sv", monkeypatch)
+    assert f"parameter int NSEC     = {len(iir.eff.sos)}," in src
+    assert "u_mul_pa1" in src and ".NEG(1'b1)" in src
+    assert "u_z1" in src and "u_z2" in src
+    # the sections that went in are the quantized ones, not the design's
+    for value in iir.fixed.ints[0][[0, 1, 2, 4, 5]]:
+        assert str(int(value)) in src
+
+
+def test_a_saturating_word_length_is_refused_with_a_dialog(app, tmp_path,
+                                                           monkeypatch):
+    shown = []
+    monkeypatch.setattr(gui.messagebox, "showerror",
+                        lambda title, msg: shown.append((title, msg)))
+    go_fixed(app, 8, frac=12)                    # forces coefficient clipping
+    assert app.fixed.saturated
+    generate_sv(app, tmp_path / "bad.sv", monkeypatch)
+    assert shown and "saturated" in shown[0][1]
+
+
+@pytest.mark.skipif(shutil.which("verilator") is None,
+                    reason="verilator is not installed")
+def test_the_generated_rtl_lints_and_runs_the_designed_filter(app, tmp_path,
+                                                              monkeypatch):
+    """End to end: design, quantize, generate, simulate, compare."""
+    import sv_export as sv
+
+    app.numtaps.set(15)
+    app.design()
+    go_fixed(app, 12)
+    app.headroom.set(3)
+    app._arith_changed()
+    src = generate_sv(app, tmp_path / "dut.sv", monkeypatch)
+
+    lint = subprocess.run([shutil.which("verilator"), "--lint-only", "-Wall",
+                           str(tmp_path / "dut.sv")],
+                          capture_output=True, text=True)
+    assert lint.returncode == 0, lint.stdout + lint.stderr
+
+    import test_sv
+    stim = [4096, -4096, 2048, 0, 1024, -3000, 3000, 100, -100]
+    got = test_sv.run_rtl(tmp_path, src, "dut", stim, app.fixed.bits, 3)
+    want = sv.simulate("fir", app.fixed.ints, stim, app.fixed.frac_bits,
+                       app.fixed.bits, 3)
+    assert got == want
+
+    # And the integers really are the filter: an impulse returns the taps.
+    frac = app.fixed.frac_bits
+    impulse = [1 << frac] + [0] * app.result.numtaps
+    taps = test_sv.run_rtl(tmp_path, src, "dut", impulse, app.fixed.bits, 3)
+    assert taps[:app.result.numtaps] == [int(v) for v in app.fixed.ints]
+
+
+# ------------------------------------------- structures, VHDL, noise and JSON
+
+
+def test_the_structure_and_folding_controls_reach_the_rtl(app, tmp_path,
+                                                          monkeypatch):
+    go_fixed(app, 12)
+    for structure in ("chain", "tree", "mac"):
+        for folded in (False, True):
+            app.structure.set(structure)
+            app.folded.set(folded)
+            app._arith_changed()
+            src = generate_sv(app, tmp_path / f"{structure}{int(folded)}.sv",
+                              monkeypatch)
+            assert f"parameter int NTERM    = {app.eff.numtaps // 2 + 1}," in src \
+                if folded else True
+            if structure == "tree":
+                assert "function automatic int level_count" in src
+            if structure == "mac":
+                assert "logic signed [WDATA-1:0] mem [0:NTAPS-1];" in src
+            if folded:
+                assert "_addw" in src
+            else:
+                assert "_addw" not in src
+
+
+def test_folding_halves_the_multipliers_in_the_status_line(app):
+    go_fixed(app, 12)
+    app.folded.set(False)
+    app._arith_changed()
+    flat = app.arith_status.get()
+    app.folded.set(True)
+    app._arith_changed()
+    folded = app.arith_status.get()
+    n = app.result.numtaps
+    assert f"{n} mult" in flat
+    assert f"{n // 2 + 1} mult" in folded
+
+
+def test_the_structure_changes_the_reported_latency(app):
+    go_fixed(app, 12)
+    app.structure.set("chain")
+    app._arith_changed()
+    assert "latency 1" in app.arith_status.get()
+    app.structure.set("mac")
+    app._arith_changed()
+    assert "latency 1" not in app.arith_status.get()
+
+
+def test_the_iir_has_no_structure_choice(iir):
+    go_fixed(iir, 16)
+    assert str(iir.structure_combo["state"]) == "disabled"
+    assert str(iir.fold_check["state"]) == "disabled"
+    opts = iir.rtl_options()
+    assert opts.structure == "chain" and opts.folded is False
+
+
+def test_a_testbench_is_written_beside_the_design(app, tmp_path, monkeypatch):
+    go_fixed(app, 12)
+    assert app.want_tb.get() is True
+    generate_sv(app, tmp_path / "dut.sv", monkeypatch)
+    tb = tmp_path / "dut_tb.sv"
+    assert tb.exists()
+    text = tb.read_text()
+    assert "module dut_tb;" in text
+    assert "EXPECT" in text and "PASS" in text
+    # and it can be turned off
+    app.want_tb.set(False)
+    generate_sv(app, tmp_path / "quiet.sv", monkeypatch)
+    assert not (tmp_path / "quiet_tb.sv").exists()
+
+
+def test_vhdl_comes_out_too(app, tmp_path, monkeypatch):
+    go_fixed(app, 12)
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                        lambda **kw: str(tmp_path / "dut.vhd"))
+    app.save_vhdl_source()
+    src = (tmp_path / "dut.vhd").read_text()
+    assert "entity dut is" in src
+    assert "use ieee.numeric_std.all;" in src
+    assert (tmp_path / "dut_tb.vhd").exists()
+
+
+def test_a_wide_word_is_refused_for_vhdl_with_a_dialog(app, tmp_path,
+                                                       monkeypatch):
+    shown = []
+    monkeypatch.setattr(gui.messagebox, "showerror",
+                        lambda title, msg: shown.append(msg))
+    go_fixed(app, 32)
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename",
+                        lambda **kw: str(tmp_path / "wide.vhd"))
+    app.save_vhdl_source()
+    assert shown and "integer generics" in shown[0]
+    assert not (tmp_path / "wide.vhd").exists()
+
+
+def test_the_smallest_word_length_is_reported(app):
+    app.load_preset("Lowpass")
+    app.use_spec.set(True)
+    app._spec_toggled()
+    go_fixed(app, 8)
+    smallest = app._smallest_word_length()
+    assert smallest and 8 < smallest < 32
+    assert f"{smallest} bits" in app.arith_status.get()
+    assert "narrowest that meets the spec" in report_text(app)
+
+    # It is the smallest: one bit fewer must miss.
+    app.word_bits.set(smallest)
+    app._arith_changed()
+    assert all(d <= w * 1.0001
+               for d, w in zip(app.eff.band_deviation, app.spec_dev))
+    app.word_bits.set(smallest - 1)
+    app._arith_changed()
+    assert any(d > w * 1.0001
+               for d, w in zip(app.eff.band_deviation, app.spec_dev))
+
+
+def test_the_noise_floor_is_measured_and_plotted(app):
+    go_fixed(app, 10)
+    app.show_noise.set(True)
+    app._noise_toggled()
+    labels = [str(ln.get_label()) for ln in app.ax_mag.get_lines()]
+    assert any("arithmetic noise" in x for x in labels)
+    assert any("as measured" in x for x in labels)
+    assert "arithmetic noise" in report_text(app)
+
+    f, noise_db, rms = app._noise_floor()
+    assert f.size > 100 and rms > 0
+    # Wider coefficients put the floor lower.
+    quiet = float(np.median(noise_db))
+    app.word_bits.set(16)
+    app._arith_changed()
+    assert float(np.median(app._noise_floor()[1])) < quiet - 10
+
+
+def test_the_noise_floor_is_not_claimed_in_floating_point(app):
+    app.show_noise.set(True)
+    app.redraw()
+    labels = [str(ln.get_label()) for ln in app.ax_mag.get_lines()]
+    assert not any("arithmetic noise" in x for x in labels)
+    assert app._noise_floor() is None
+
+
+def test_a_design_round_trips_through_json(app, tmp_path, monkeypatch):
+    app.fs.set(48000.0)
+    app.load_preset("Bandpass")          # the preset scales its edges by fs
+    app.numtaps.set(37)
+    app.design()
+    go_fixed(app, 14)
+    app.headroom.set(5)
+    app.structure.set("tree")
+    app.folded.set(True)
+    app.show_noise.set(True)
+    app._arith_changed()
+    before = app.to_dict()
+
+    path = tmp_path / "design.json"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    app.save_design()
+    assert path.exists()
+
+    # Change everything, then load it back.
+    app.load_preset("Lowpass")
+    app.numtaps.set(9)
+    app.fs.set(1.0)
+    app.arith.set(gui.ARITH_FLOAT)
+    app.structure.set("chain")
+    app.folded.set(False)
+    app.show_noise.set(False)
+    app.design()
+
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **kw: str(path))
+    app.open_design()
+    assert app.to_dict() == before
+    assert app.result.numtaps == 37
+    assert app.fixed is not None and app.fixed.bits == 14
+    assert app.headroom.get() == 5
+
+
+def test_an_iir_design_round_trips_too(iir, tmp_path, monkeypatch):
+    iir.load_iir_preset("Chebyshev I lowpass")
+    iir.design()
+    go_fixed(iir, 18)
+    before = iir.to_dict()
+    path = tmp_path / "iir.json"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    iir.save_design()
+
+    iir.mode.set(gui.MODE_FIR)
+    iir.switch_mode()
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **kw: str(path))
+    iir.open_design()
+    assert iir.is_iir()
+    assert iir.to_dict() == before
+    assert iir.iir_result is not None
+
+
+def test_a_file_that_is_not_a_design_is_refused(app, tmp_path, monkeypatch):
+    shown = []
+    monkeypatch.setattr(gui.messagebox, "showerror",
+                        lambda title, msg: shown.append(msg))
+    bad = tmp_path / "other.json"
+    bad.write_text('{"hello": 1}')
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **kw: str(bad))
+    app.open_design()
+    assert shown
+    assert app.result is not None          # the current design is left alone
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json")
+    monkeypatch.setattr(gui.filedialog, "askopenfilename",
+                        lambda **kw: str(broken))
+    app.open_design()
+    assert len(shown) == 2
+
+
+def test_a_degenerate_design_is_not_given_a_noise_floor(app):
+    # Setting the sample rate after a preset leaves the bands absurdly narrow
+    # for the tap count, the amplitude runs away in the transition, and there is
+    # nothing to measure.  It must say so rather than plot nonsense.
+    app.load_preset("Bandpass")
+    app.fs.set(48000.0)
+    app.numtaps.set(37)
+    app.design()
+    go_fixed(app, 14)
+    app.show_noise.set(True)
+    app._noise_toggled()
+    assert app._noise_floor() is None
+    labels = [str(ln.get_label()) for ln in app.ax_mag.get_lines()]
+    assert not any("arithmetic noise" in x for x in labels)
+    assert "could not be measured" in report_text(app)
+
+
+# ------------------------------------------------------- collapsible panels
+
+
+def test_every_panel_on_the_left_can_be_folded_away(app):
+    assert set(app.panels) == {"Filter", "Bands and constraints", "Filter (IIR)",
+                               "Bands and specification", "Arithmetic",
+                               "Display", "Result"}
+    for title, panel in app.panels.items():
+        assert panel.collapsed is False, title
+        assert panel.button.winfo_exists()
+        panel.toggle()
+        assert panel.collapsed is True, title
+        # grid_info empties when a widget is removed from the grid, and unlike
+        # winfo_ismapped it means something for a window that is withdrawn.
+        assert panel.body.grid_info() == {}, title
+        panel.toggle()
+        assert panel.collapsed is False, title
+        assert panel.body.grid_info() != {}, title
+
+
+def test_the_button_says_which_way_it_goes(app):
+    panel = app.panels["Arithmetic"]
+    assert panel.button.cget("text") == gui.Panel.SHOWN
+    panel.toggle()
+    assert panel.button.cget("text") == gui.Panel.HIDDEN
+    panel.toggle()
+    assert panel.button.cget("text") == gui.Panel.SHOWN
+
+
+def test_the_control_is_at_the_top_right_of_the_panel(app):
+    for title, panel in app.panels.items():
+        head = panel.button.master
+        info = panel.button.grid_info()
+        # Last column of the header row, and the header is the panel's first row.
+        assert int(info["row"]) == 0, title
+        assert int(info["column"]) == 1, title
+        assert "e" in str(info["sticky"]), title
+        assert int(head.grid_info()["row"]) == 0, title
+
+
+def test_every_panel_stacks_from_the_top(app):
+    """No panel stretches, so none of them sit against the bottom of the pane.
+
+    A panel that grew with the window had to take that space from the panels
+    below it, which is what pushed the lower ones down to the bottom edge.
+    """
+    root = app.root
+    root.deiconify()
+    root.geometry("1300x620")
+    for _ in range(12):
+        root.update()
+
+    stacked = sorted((p for p in app.panels.values()
+                      if p.grid_info() and p.master is app.controls),
+                     key=lambda q: int(q.grid_info()["row"]))
+    tops = [p.winfo_y() for p in stacked]
+    assert tops == sorted(tops)                  # in row order, down the column
+
+    # None of them is taller than it asked to be, which is what stretching
+    # would look like.  (They are not adjacent: the action buttons sit between
+    # the Arithmetic and Display panels.)
+    for panel in app.panels.values():
+        if panel.grid_info():
+            assert panel.winfo_height() <= panel.winfo_reqheight() + 2, panel.title
+
+    # And no row is configured to soak up leftover height.
+    for panel in app.panels.values():
+        row = int(panel.grid_info()["row"])
+        assert int(panel.master.rowconfigure(row)["weight"]) == 0, panel.title
+    root.withdraw()
+
+
+def test_the_column_scrolls_when_the_panels_do_not_fit(app):
+    root = app.root
+    root.deiconify()
+    root.geometry("1300x620")
+    for _ in range(14):
+        root.update()
+
+    canvas = app.canvas_controls
+    tall = int(canvas.cget("scrollregion").split()[3])
+    assert tall > canvas.winfo_height()           # more than fits
+    first, last = app.scroll.get()
+    assert (first, last) != (0.0, 1.0)            # so the bar has a thumb
+
+    app._wheel(type("E", (), {"delta": -3})())
+    for _ in range(4):
+        root.update()
+    assert app.scroll.get()[0] > first            # and the wheel moves it
+    root.withdraw()
+
+
+def test_folding_shortens_the_column_to_scroll(app):
+    root = app.root
+    root.deiconify()
+    root.geometry("1300x620")
+    for _ in range(12):
+        root.update()
+
+    def height():
+        return int(app.canvas_controls.cget("scrollregion").split()[3])
+
+    before = height()
+    app.panels["Arithmetic"].toggle()
+    for _ in range(10):
+        root.update()
+    assert height() < before - 100                # a whole panel's worth
+    app.panels["Arithmetic"].toggle()
+    for _ in range(10):
+        root.update()
+    assert height() == before
+    root.withdraw()
+
+
+def test_the_controls_are_never_squeezed_narrower_than_they_need(app):
+    """Grid answers a too-narrow column by clipping the right of the band table,
+    which is where the remove-band buttons are."""
+    root = app.root
+    root.deiconify()
+    root.geometry("1300x620")
+    for _ in range(16):
+        root.update()
+    assert app.controls.winfo_width() >= app.controls.winfo_reqwidth()
+    assert app.table.winfo_width() >= app.table.winfo_reqwidth()
+    for row in app.rows:
+        right = (row.remove.winfo_rootx() + row.remove.winfo_width()
+                 - app.table.winfo_rootx())
+        assert right <= app.table.winfo_width()
+    root.withdraw()
+
+
+def test_the_report_is_a_fixed_height_with_its_own_inset_scrollbar(app):
+    root = app.root
+    root.deiconify()
+    root.geometry("1300x620")
+    for _ in range(12):
+        root.update()
+    tall = app.report.winfo_height()
+
+    root.geometry("1300x1000")                # a much taller window
+    for _ in range(12):
+        root.update()
+    assert app.report.winfo_height() == tall   # unchanged: it scrolls itself
+
+    # Its scrollbar is inset, so it does not sit flush against the one that
+    # scrolls the whole column.
+    assert int(app.report_scroll.grid_info()["padx"][1]) > 0
+    inner_right = (app.report_scroll.winfo_rootx()
+                   + app.report_scroll.winfo_width())
+    assert inner_right < app.scroll.winfo_rootx(), "the scrollbars are touching"
+    root.withdraw()
+
+
+def test_folding_does_not_disturb_the_design(app):
+    before = app.result.h.copy()
+    for panel in app.panels.values():
+        panel.toggle()
+    assert np.array_equal(app.result.h, before)
+    assert app.result is not None
+    # And the fields are still there to be read once unfolded.
+    for panel in app.panels.values():
+        panel.toggle()
+    app.rows[0].vars[1].set("0.15")
+    app.design()
+    assert not np.array_equal(app.result.h, before)
+
+
+def test_which_panels_are_folded_is_saved_with_the_design(app, tmp_path,
+                                                          monkeypatch):
+    app.panels["Display"].toggle()
+    app.panels["Arithmetic"].toggle()
+    before = app.to_dict()
+    assert before["display"]["folded_panels"] == ["Arithmetic", "Display"]
+
+    path = tmp_path / "layout.json"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    app.save_design()
+
+    app.panels["Display"].toggle()          # open them again
+    app.panels["Arithmetic"].toggle()
+    app.panels["Result"].toggle()           # and fold a different one
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **kw: str(path))
+    app.open_design()
+
+    assert app.panels["Display"].collapsed
+    assert app.panels["Arithmetic"].collapsed
+    assert not app.panels["Result"].collapsed
+    assert app.to_dict() == before
+
+
+def test_folding_survives_a_mode_switch(iir):
+    iir.panels["Arithmetic"].toggle()
+    assert iir.panels["Arithmetic"].collapsed
+    iir.mode.set(gui.MODE_FIR)
+    iir.switch_mode()
+    assert iir.panels["Arithmetic"].collapsed
+    assert iir.result is not None
+
+
+# ------------------------------------------------------------------ the CLI
+
+
+def test_the_parser_accepts_nothing_at_all(app):
+    args = gui.build_parser().parse_args([])
+    assert args.design is None
+    assert args.geometry is None
+
+
+def test_help_and_version_exit_cleanly_without_a_window(capsys):
+    for flag in ("--help", "--version"):
+        with pytest.raises(SystemExit) as exit:
+            gui.build_parser().parse_args([flag])
+        assert exit.value.code == 0
+        out = capsys.readouterr().out
+        assert out.strip()
+        if flag == "--help":
+            assert "DESIGN.json" in out and "--geometry" in out
+        else:
+            assert gui.__version__ in out
+
+
+def test_an_unknown_option_is_refused(capsys):
+    with pytest.raises(SystemExit) as exit:
+        gui.build_parser().parse_args(["--wat"])
+    assert exit.value.code == 2
+    assert "unrecognized" in capsys.readouterr().err
+
+
+def test_the_arguments_are_read(app):
+    args = gui.build_parser().parse_args(["thing.json", "--geometry", "1280x800"])
+    assert args.design == "thing.json"
+    assert args.geometry == "1280x800"
+
+
+def test_a_design_given_on_the_command_line_is_loaded(app, tmp_path,
+                                                      monkeypatch):
+    app.load_preset("Bandpass")
+    app.numtaps.set(37)
+    app.design()
+    go_fixed(app, 14)
+    app.structure.set("tree")
+    app.folded.set(True)
+    app._arith_changed()
+    wanted = app.to_dict()
+
+    path = tmp_path / "cli.json"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    app.save_design()
+
+    # What main() does with the argument, short of entering the mainloop.
+    state = gui.read_design(str(path))
+    fresh = tk.Tk()
+    try:
+        fresh.withdraw()
+        other = gui.RemezApp(fresh)
+        other.from_dict(state)
+        assert other.to_dict() == wanted
+        assert other.result.numtaps == 37
+        assert other.structure.get() == "tree" and other.folded.get()
+    finally:
+        fresh.destroy()
+
+
+def test_a_missing_design_file_is_reported_not_raised(capsys):
+    assert gui.main(["definitely-not-here.json"]) == 2
+    assert "cannot open" in capsys.readouterr().err
+
+
+def test_a_file_that_is_not_a_design_is_reported(tmp_path, capsys):
+    path = tmp_path / "other.json"
+    path.write_text('{"hello": 1}')
+    assert gui.main([str(path)]) == 2
+    err = capsys.readouterr().err
+    assert "not a design this can load" in err
+
+
+def test_neither_failure_leaves_a_window_behind(tmp_path):
+    """main() must not enter the mainloop, or the test suite would hang."""
+    path = tmp_path / "bad.json"
+    path.write_text("{not json")
+    assert gui.main([str(path)]) == 2
+
+
+# --------------------------------------------- the sample rate scales the bands
+
+
+def band_edges(app):
+    return [(row.vars[0].get(), row.vars[1].get()) for row in app.rows]
+
+
+def set_rate(app, rate):
+    """What committing a new sample rate in the entry does."""
+    app.fs.set(rate)
+    app._sample_rate_changed()
+
+
+def test_changing_the_rate_moves_the_band_edges(app):
+    assert band_edges(app) == [("0", "0.2"), ("0.25", "0.5")]
+    set_rate(app, 48000.0)
+    assert band_edges(app) == [("0", "9600"), ("12000", "24000")]
+
+
+def test_the_filter_itself_does_not_change(app):
+    """The whole point: the units change, the design does not."""
+    before = app.result.h.copy()
+    set_rate(app, 48000.0)
+    assert np.allclose(app.result.h, before, atol=1e-12)
+    assert app.result.fs == 48000.0
+    assert app.result.bands[1].f1 == pytest.approx(0.25 * 48000)
+
+
+def test_the_edges_come_back_when_the_rate_does(app):
+    original = band_edges(app)
+    set_rate(app, 44100.0)
+    set_rate(app, 1.0)
+    assert band_edges(app) == original
+
+
+def test_an_awkward_edge_survives_the_round_trip(app):
+    """%g at six figures would round 5925.925872 and never give 0.123456789
+    back again."""
+    app.rows[0].vars[1].set("0.123456789")
+    set_rate(app, 48000.0)
+    assert app.rows[0].vars[1].get() == "5925.925872"
+    set_rate(app, 1.0)
+    assert float(app.rows[0].vars[1].get()) == pytest.approx(0.123456789, rel=1e-12)
+
+
+def test_only_frequencies_move(app):
+    app.load_preset("Multiband")
+    gains = [(r.vars[2].get(), r.vars[3].get()) for r in app.rows]
+    weights = [(r.vars[4].get(), r.vars[5].get()) for r in app.rows]
+    set_rate(app, 48000.0)
+    assert [(r.vars[2].get(), r.vars[3].get()) for r in app.rows] == gains
+    assert [(r.vars[4].get(), r.vars[5].get()) for r in app.rows] == weights
+
+
+def test_the_iir_edges_move_and_its_dB_specs_do_not(iir):
+    sos = iir.iir_result.sos.copy()
+    rp, rs = iir.iir_rp.get(), iir.iir_rs.get()
+    set_rate(iir, 44100.0)
+    assert iir.iir_wp[0].get() == "8820"
+    assert iir.iir_ws[0].get() == "11025"
+    assert (iir.iir_rp.get(), iir.iir_rs.get()) == (rp, rs)
+    assert np.allclose(iir.iir_result.sos, sos, atol=1e-12)
+
+
+def test_the_other_mode_is_kept_in_step(app):
+    """The rate is shared, so a stale edge in the mode that is not showing
+    would be wrong the moment it was switched to."""
+    set_rate(app, 48000.0)
+    assert app.iir_wp[0].get() == "9600"
+    app.mode.set(gui.MODE_IIR)
+    app.switch_mode()
+    assert app.iir_result is not None, report_text(app)
+    assert app.iir_result.wp[0] == pytest.approx(9600.0)
+
+
+@pytest.mark.parametrize("rate", [0.0, -5.0])
+def test_a_rate_that_is_not_a_rate_leaves_the_edges_alone(app, rate):
+    before = band_edges(app)
+    baseline = app.fs_baseline
+    set_rate(app, rate)
+    assert band_edges(app) == before
+    assert app.fs_baseline == baseline      # so a later good value still works
+    set_rate(app, 2.0)
+    assert band_edges(app) == [("0", "0.4"), ("0.5", "1")]
+
+
+def test_committing_the_same_rate_twice_scales_once(app):
+    set_rate(app, 48000.0)
+    once = band_edges(app)
+    set_rate(app, 48000.0)
+    assert band_edges(app) == once
+
+
+def test_a_field_being_edited_is_left_alone(app):
+    app.rows[0].vars[1].set("")             # mid-edit, not a number yet
+    set_rate(app, 48000.0)
+    assert app.rows[0].vars[1].get() == ""
+    assert app.rows[1].vars[0].get() == "12000"   # the rest still moved
+
+
+def test_a_preset_loaded_afterwards_uses_the_new_rate(app):
+    set_rate(app, 48000.0)
+    app.load_preset("Bandpass")
+    assert band_edges(app)[0] == ("0", "5760")    # 0.12 of 48000
+
+
+def test_opening_a_design_does_not_scale_it_again(app, tmp_path, monkeypatch):
+    set_rate(app, 44100.0)
+    app.design()
+    saved = app.to_dict()
+    path = tmp_path / "rate.json"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **kw: str(path))
+    app.save_design()
+
+    set_rate(app, 1.0)                      # somewhere else entirely
+    monkeypatch.setattr(gui.filedialog, "askopenfilename", lambda **kw: str(path))
+    app.open_design()
+    assert app.to_dict() == saved
+    assert app.fs_baseline == 44100.0
+    # And a change made now scales from the file's rate, not the old one.
+    set_rate(app, 88200.0)
+    assert app.rows[1].vars[0].get() == "22050"
+
+
+# --------------------------------------------- the generated program's interface
+
+
+def test_the_generated_c_is_a_program_by_default(app, tmp_path, monkeypatch):
+    """main is in unless it is asked to be left out, which is the way round a
+    generated filter is most often wanted."""
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    assert "#ifndef FILTER_NO_MAIN" in text
+    assert "FILTER_MAIN" not in text.replace("FILTER_NO_MAIN", "")
+    assert "int main(int argc, char **argv)" in text
+    # It compiles as a program with no defines at all.
+    exe = build_c(tmp_path, text)
+    assert exe.exists()
+
+
+def test_it_can_still_be_built_as_a_library(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler available")
+    src = tmp_path / "lib.c"
+    src.write_text(text)
+    build = subprocess.run(
+        [cc, "-std=c99", "-Wall", "-Wextra", "-pedantic", "-O2", "-c",
+         "-DFILTER_NO_MAIN", "-o", str(tmp_path / "lib.o"), str(src)],
+        capture_output=True, text=True)
+    assert build.returncode == 0, build.stderr
+    assert build.stderr == "", build.stderr
+
+
+def test_the_program_names_itself_after_the_file(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "my_lowpass.c", monkeypatch)
+    assert 'static const char *progname = "my_lowpass";' in text
+
+
+def test_the_program_reads_and_writes_raw_doubles(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    x = np.random.default_rng(3).standard_normal(500)
+    got = build_and_run(tmp_path, text, x)
+    assert got.dtype == np.dtype("=f8")
+    assert len(got) == len(x)
+    assert np.allclose(got, np.convolve(x, app.result.h)[:len(x)], atol=1e-12)
+
+
+def test_it_filters_a_named_file_to_a_named_file(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    exe = build_c(tmp_path, text)
+    x = np.random.default_rng(4).standard_normal(300)
+    src = tmp_path / "in.f64"
+    dst = tmp_path / "out.f64"
+    src.write_bytes(np.asarray(x, dtype="=f8").tobytes())
+
+    run = subprocess.run([str(exe), "-o", str(dst), str(src)],
+                         capture_output=True)
+    assert run.returncode == 0, run.stderr.decode()
+    got = np.frombuffer(dst.read_bytes(), dtype="=f8")
+    assert np.allclose(got, np.convolve(x, app.result.h)[:len(x)], atol=1e-12)
+
+
+def test_a_dash_means_stdin(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    x = np.arange(20, dtype=float)
+    piped = build_and_run(tmp_path, text, x)
+    dashed = build_and_run(tmp_path, text, x, args=("-",))
+    assert np.array_equal(piped, dashed)
+
+
+def test_the_help_text_explains_itself(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    exe = build_c(tmp_path, text)
+    for flag in ("-h", "--help"):
+        run = subprocess.run([str(exe), flag], capture_output=True, text=True)
+        assert run.returncode == 0
+        assert "usage:" in run.stdout
+        assert "raw 64 bit float" in run.stdout
+
+
+def test_bad_arguments_are_refused(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    exe = build_c(tmp_path, text)
+    for args, complaint in (
+            (["-o"], "needs a filename"),
+            (["--wat"], "unknown option"),
+            (["one", "two"], "only one input file"),
+            (["/nonexistent/file"], "No such file")):
+        run = subprocess.run([str(exe), *args], capture_output=True, text=True,
+                             input="")
+        assert run.returncode == 1, args
+        assert complaint in run.stderr, (args, run.stderr)
+
+
+def test_a_trailing_part_sample_is_reported_and_dropped(app, tmp_path,
+                                                        monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    exe = build_c(tmp_path, text)
+    x = np.arange(8, dtype=float)
+    payload = np.asarray(x, dtype="=f8").tobytes() + b"\x01\x02\x03"
+    run = subprocess.run([str(exe)], input=payload, capture_output=True)
+    assert run.returncode == 0
+    assert len(np.frombuffer(run.stdout, dtype="=f8")) == len(x)
+    assert b"trailing" in run.stderr
+
+
+def test_an_empty_input_is_not_an_error(app, tmp_path, monkeypatch):
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    exe = build_c(tmp_path, text)
+    run = subprocess.run([str(exe)], input=b"", capture_output=True)
+    assert run.returncode == 0
+    assert run.stdout == b""
+
+
+def test_a_block_boundary_does_not_disturb_the_filter(app, tmp_path,
+                                                      monkeypatch):
+    """It reads 4096 samples at a time; the state has to carry across."""
+    text = save_c(app, tmp_path / "fir.c", monkeypatch)
+    x = np.random.default_rng(5).standard_normal(10000)
+    got = build_and_run(tmp_path, text, x)
+    assert np.allclose(got, np.convolve(x, app.result.h)[:len(x)], atol=1e-12)
+
+
+# ------------------------------------------------- the magnitude plot's y range
+
+
+def spec_lowpass(app, attenuation, numtaps=41):
+    """A lowpass specified in dB, like the screenshot that reported this."""
+    app.fs.set(32000.0)
+    app._sample_rate_changed()
+    app.rows[0].vars[1].set("6400")
+    app.rows[1].vars[0].set("8000")
+    app.rows[1].vars[1].set("16000")
+    app.rows[0].vars[5].set("0.5")
+    app.rows[1].vars[5].set(str(attenuation))
+    app.numtaps.set(numtaps)
+    app.use_spec.set(True)
+    app._spec_toggled()
+    return app.ax_mag.get_ylim()
+
+
+def test_the_stopband_is_not_cut_off_the_bottom(app):
+    """Asking for 80 dB used to leave the axis at about -44 dB.
+
+    The floor came from delta, which is the *weighted* deviation: with weights
+    derived from dB specs it is essentially the passband's number and says
+    nothing about how deep the stopband goes.
+    """
+    lo, hi = spec_lowpass(app, 80)
+    achieved = 20 * np.log10(app.result.band_deviation[1])
+    requested = 20 * np.log10(app.spec_dev[1])
+    assert lo < achieved, (lo, achieved)      # the response is on the plot
+    assert lo < requested, (lo, requested)    # and so is the line it is judged by
+    assert hi >= 5.0
+
+
+def test_a_deeper_spec_takes_the_axis_deeper(app):
+    floors = [spec_lowpass(app, att)[0] for att in (40, 60, 80, 100)]
+    assert floors == sorted(floors, reverse=True)
+    assert floors[0] > floors[-1] + 40        # and by a useful amount
+
+
+def test_the_axis_follows_what_the_filter_achieves(app):
+    """More taps make the stopband deeper, and the plot has to keep up."""
+    seen = []
+    for numtaps in (41, 81, 121):
+        lo, _ = spec_lowpass(app, 80, numtaps)
+        achieved = 20 * np.log10(app.result.band_deviation[1])
+        assert lo < achieved
+        seen.append(lo)
+    assert seen == sorted(seen, reverse=True)
+
+
+def test_a_design_with_no_dB_specs_is_still_framed(app):
+    assert app.spec_dev is None
+    lo, _ = app.ax_mag.get_ylim()
+    assert lo < 20 * np.log10(app.result.band_deviation[1])
+
+
+@pytest.mark.parametrize("name", list(gui.PRESETS))
+def test_every_preset_is_framed_sensibly(app, name):
+    app.load_preset(name)
+    app.design()
+    lo, hi = app.ax_mag.get_ylim()
+    assert -220.0 <= lo <= -20.0              # never absurd, never shallow
+    assert hi >= 5.0
+    for band, dev in zip(app.result.bands, app.result.band_deviation):
+        target = max(abs(band.d1), abs(band.d2))
+        if target < 1e-12 and dev > 0:        # a stopband: it must be visible
+            assert lo < 20 * np.log10(dev)
+
+
+def test_the_noise_floor_is_inside_the_axis_when_it_is_shown(app):
+    spec_lowpass(app, 80, numtaps=81)
+    go_fixed(app, 16)
+    app.show_noise.set(True)
+    app._noise_toggled()
+    measured = app._noise_floor()
+    assert measured is not None
+    lo, _ = app.ax_mag.get_ylim()
+    assert lo < float(np.median(measured[1]))
