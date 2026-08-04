@@ -32,6 +32,42 @@ class Corridor {
   final Color colour;
 }
 
+/// A label pointing at a place on the plot, in data coordinates.
+///
+/// Used by the tutorial figures to name the part of the curve each parameter
+/// controls. The offset is in pixels, so a callout keeps its distance from the
+/// curve whatever the axes are scaled to.
+class Callout {
+  const Callout(this.x, this.y, this.text,
+      {this.dx = 0, this.dy = -26, this.colour});
+  final double x;
+  final double y;
+  final String text;
+  final double dx;
+  final double dy;
+  final Color? colour;
+}
+
+/// A span between two frequencies, drawn as a measured bar.
+///
+/// What names a transition width or a band: an arrow at each end and the label
+/// between them.
+class Span {
+  const Span(this.x0, this.x1, this.y, this.text,
+      {this.colour, this.above = true});
+  final double x0;
+  final double x1;
+
+  /// Where to draw it, in data coordinates.
+  final double y;
+  final String text;
+  final Color? colour;
+
+  /// Which side of the bar the label sits on. A bar near the top of the plot
+  /// wants it underneath, or it lands outside the frame.
+  final bool above;
+}
+
 /// Points drawn as dots, for the extremal frequencies.
 class Markers {
   const Markers(this.x, this.y, this.colour, {this.radius = 2.4});
@@ -50,6 +86,8 @@ class LinePlot extends StatelessWidget {
     required this.yLabel,
     this.corridors = const [],
     this.markers = const [],
+    this.callouts = const [],
+    this.spans = const [],
     this.xRange,
     this.yRange,
     this.height = 220,
@@ -60,6 +98,8 @@ class LinePlot extends StatelessWidget {
   final List<Trace> traces;
   final List<Corridor> corridors;
   final List<Markers> markers;
+  final List<Callout> callouts;
+  final List<Span> spans;
   final String xLabel;
   final String yLabel;
   final (double, double)? xRange;
@@ -87,6 +127,8 @@ class LinePlot extends StatelessWidget {
                 traces: traces,
                 corridors: corridors,
                 markers: markers,
+                callouts: callouts,
+                spans: spans,
                 xLabel: xLabel,
                 yLabel: yLabel,
                 xRange: xRange,
@@ -108,6 +150,8 @@ class _PlotPainter extends CustomPainter {
     required this.traces,
     required this.corridors,
     required this.markers,
+    required this.callouts,
+    required this.spans,
     required this.xLabel,
     required this.yLabel,
     required this.xRange,
@@ -120,6 +164,8 @@ class _PlotPainter extends CustomPainter {
   final List<Trace> traces;
   final List<Corridor> corridors;
   final List<Markers> markers;
+  final List<Callout> callouts;
+  final List<Span> spans;
   final String xLabel;
   final String yLabel;
   final (double, double)? xRange;
@@ -213,6 +259,45 @@ class _PlotPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1);
 
+    // Spans first, then callouts, so a label sits over its own bar.
+    for (final span in spans) {
+      final ink = span.colour ?? foreground;
+      final y = sy(span.y);
+      final x0 = sx(span.x0), x1 = sx(span.x1);
+      final paint = Paint()
+        ..color = ink
+        ..strokeWidth = 1.0;
+      canvas.drawLine(Offset(x0, y), Offset(x1, y), paint);
+      for (final end in [(x0, 1.0), (x1, -1.0)]) {
+        // End caps, drawn as a tick rather than an arrowhead: at the widths a
+        // transition band gets, a head is bigger than the bar it terminates.
+        canvas.drawLine(Offset(end.$1, y - 4), Offset(end.$1, y + 4), paint);
+      }
+      _text(canvas, span.text, Offset((x0 + x1) / 2, y + (span.above ? -6 : 6)),
+          align: TextAlign.center,
+          centre: true,
+          colour: ink,
+          anchorBottom: span.above);
+    }
+
+    for (final callout in callouts) {
+      final ink = callout.colour ?? foreground;
+      final at = Offset(sx(callout.x), sy(callout.y));
+      final to = at + Offset(callout.dx, callout.dy);
+      canvas.drawLine(
+          at,
+          to,
+          Paint()
+            ..color = ink
+            ..strokeWidth = 0.9);
+      canvas.drawCircle(at, 2.0, Paint()..color = ink);
+      _text(canvas, callout.text, to + Offset(0, callout.dy < 0 ? -2 : 2),
+          align: TextAlign.center,
+          centre: true,
+          colour: ink,
+          anchorBottom: callout.dy < 0);
+    }
+
     if (empty != null) {
       _text(canvas, empty!, plot.center,
           align: TextAlign.center, centre: true, muted: true);
@@ -247,13 +332,17 @@ class _PlotPainter extends CustomPainter {
       {TextAlign align = TextAlign.left,
       bool centre = false,
       bool anchorRight = false,
-      bool muted = false}) {
+      bool anchorBottom = false,
+      bool muted = false,
+      Color? colour}) {
     final painter = TextPainter(
       text: TextSpan(
         text: value,
         style: TextStyle(
-          color: muted ? foreground.withValues(alpha: 0.7) : foreground,
+          color: colour ??
+              (muted ? foreground.withValues(alpha: 0.7) : foreground),
           fontSize: 10,
+          fontWeight: colour == null ? FontWeight.normal : FontWeight.w600,
         ),
       ),
       textAlign: align,
@@ -262,7 +351,9 @@ class _PlotPainter extends CustomPainter {
     var dx = at.dx;
     if (centre) dx -= painter.width / 2;
     if (anchorRight) dx -= painter.width;
-    canvas.paint(painter, Offset(dx, at.dy - (anchorRight ? 6 : 0)));
+    var dy = at.dy - (anchorRight ? 6 : 0);
+    if (anchorBottom) dy -= painter.height;
+    canvas.paint(painter, Offset(dx, dy));
   }
 
   (double, double) _extent(Iterable<Float64List> lists) {

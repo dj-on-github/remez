@@ -13,6 +13,9 @@ flutter run -d macos      # or windows, linux, chrome
 flutter test
 ```
 
+**[docs/tutorial.md](docs/tutorial.md)** is the user guide: annotated responses,
+every panel explained, the filter types compared, and the save format.
+
 It builds and presents itself as **remez** -- the app bundle, the window title,
 the usage text, the header of every file it generates, the Dart package, and
 the bundle identifier `com.deadhat.remez` on every platform that has one.
