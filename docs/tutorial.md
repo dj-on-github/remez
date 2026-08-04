@@ -15,7 +15,9 @@ Two families are on offer:
 
 Every figure below is generated from the program itself by
 `test/make_docs_test.dart`, so if the interface changes and this document is not
-regenerated, the tests notice.
+regenerated, the tests notice. It loads real fonts before rendering: `flutter
+test` normally substitutes a font whose every glyph is a filled rectangle,
+which is right for a layout golden and useless for a screenshot.
 
 ---
 

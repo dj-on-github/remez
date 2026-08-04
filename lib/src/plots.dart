@@ -134,6 +134,7 @@ class LinePlot extends StatelessWidget {
                 xRange: xRange,
                 yRange: yRange,
                 empty: empty,
+                fontFamily: theme.textTheme.bodySmall?.fontFamily,
                 foreground: theme.colorScheme.onSurface,
                 grid: theme.colorScheme.onSurface.withValues(alpha: 0.14),
               ),
@@ -157,6 +158,7 @@ class _PlotPainter extends CustomPainter {
     required this.xRange,
     required this.yRange,
     required this.empty,
+    required this.fontFamily,
     required this.foreground,
     required this.grid,
   });
@@ -171,6 +173,10 @@ class _PlotPainter extends CustomPainter {
   final (double, double)? xRange;
   final (double, double)? yRange;
   final String? empty;
+
+  /// The theme's font, named explicitly: a painter builds its own spans, so it
+  /// inherits nothing and would otherwise get the platform default.
+  final String? fontFamily;
   final Color foreground;
   final Color grid;
 
@@ -342,6 +348,7 @@ class _PlotPainter extends CustomPainter {
           color: colour ??
               (muted ? foreground.withValues(alpha: 0.7) : foreground),
           fontSize: 10,
+          fontFamily: fontFamily,
           fontWeight: colour == null ? FontWeight.normal : FontWeight.w600,
         ),
       ),

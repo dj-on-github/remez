@@ -17,12 +17,74 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:remez/main.dart';
 import 'package:remez/src/controller.dart';
 import 'package:remez/src/plots.dart';
 
 const String _dir = 'docs/images';
+
+/// Load real fonts, so the figures carry words rather than boxes.
+///
+/// `flutter test` substitutes a test font whose every glyph is a filled
+/// rectangle -- deliberately, so that layout goldens do not depend on what is
+/// installed. That is right for a layout golden and useless for documentation,
+/// so this registers the Roboto that ships with the SDK under the family the
+/// Material theme actually asks for, plus the icon font.
+///
+/// Returns false when the SDK fonts cannot be found, which the tests report
+/// rather than quietly writing unreadable figures.
+Future<bool> _loadRealFonts() async {
+  final root = Platform.environment['FLUTTER_ROOT'];
+  if (root == null) return false;
+  final dir = Directory('$root/bin/cache/artifacts/material_fonts');
+  if (!dir.existsSync()) return false;
+
+  Future<bool> load(String family, List<String> files) async {
+    final loader = FontLoader(family);
+    var any = false;
+    for (final name in files) {
+      final file = File('${dir.path}/$name');
+      if (!file.existsSync()) continue;
+      loader.addFont(
+          Future.value(ByteData.view(file.readAsBytesSync().buffer)));
+      any = true;
+    }
+    if (any) await loader.load();
+    return any;
+  }
+
+  final text = await load('Roboto',
+      ['Roboto-Regular.ttf', 'Roboto-Medium.ttf', 'Roboto-Bold.ttf']);
+  await load('MaterialIcons', ['MaterialIcons-Regular.otf']);
+  return text && await _loadMonospace();
+}
+
+/// A real monospaced font for the Result panel.
+///
+/// The SDK ships no monospace, and the report is the one place where the
+/// columns only line up because the font is fixed pitch -- substituting Roboto
+/// would produce a figure that renders but misrepresents the panel. So a system
+/// font is used, and its absence is a failure rather than a silent fallback.
+Future<bool> _loadMonospace() async {
+  const candidates = [
+    '/System/Library/Fonts/SFNSMono.ttf',
+    '/System/Library/Fonts/Supplemental/Andale Mono.ttf',
+    '/System/Library/Fonts/Supplemental/Courier New.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',
+    '/usr/share/fonts/TTF/DejaVuSansMono.ttf',
+  ];
+  for (final path in candidates) {
+    final file = File(path);
+    if (!file.existsSync()) continue;
+    final loader = FontLoader('monospace')
+      ..addFont(Future.value(ByteData.view(file.readAsBytesSync().buffer)));
+    await loader.load();
+    return true;
+  }
+  return false;
+}
 
 /// Oversampled, so the figures are readable when a browser scales them down.
 const double _scale = 2.0;
@@ -66,11 +128,19 @@ Future<DesignController> _open(WidgetTester tester,
   await tester.pumpAndSettle();
   final state = tester.state<State<DesignerPage>>(find.byType(DesignerPage));
   // ignore: avoid_dynamic_calls
-  final c = (state as dynamic).controller as DesignController;
-  // A fixed figure in the app bar, so re-running does not rewrite every panel
-  // figure for a timing difference.
-  c.lastDesignTime = const Duration(microseconds: 1234);
-  return c;
+  return (state as dynamic).controller as DesignController;
+}
+
+/// Pin the design time and force the rebuild that shows it.
+///
+/// The Result panel prints how long the design took, which differs on every
+/// run and would rewrite that figure each time. Assigning the field is not
+/// enough: it does not go through `update`, so nothing is notified and the
+/// panel keeps painting the real duration.
+Future<void> _pinTiming(WidgetTester tester, DesignController c) async {
+  c.lastDesignTime = const Duration(microseconds: 12300);
+  tester.element(find.byType(DesignerPage)).markNeedsBuild();
+  await tester.pumpAndSettle();
 }
 
 /// The panel with this title, as a croppable rectangle.
@@ -79,6 +149,12 @@ Finder _panel(String title) =>
 
 void main() {
   final write = autoUpdateGoldenFiles;
+
+  setUpAll(() async {
+    expect(await _loadRealFonts(), isTrue,
+        reason: 'a font was missing, so figures would be drawn in the test '
+            'font and carry filled boxes instead of words');
+  });
 
   testWidgets('the panels', (tester) async {
     final c = await _open(tester);
@@ -97,6 +173,9 @@ void main() {
     await shot('panel-arithmetic', 'Arithmetic');
     await shot('panel-file', 'File');
     await shot('panel-display', 'Display');
+    await _pinTiming(tester, c);
+    expect(find.textContaining('designed in 12.3 ms'), findsWidgets,
+        reason: 'the pinned duration is not what the report is showing');
     await shot('panel-result', 'Result');
 
     // The arithmetic panel only shows the word length and the hardware options

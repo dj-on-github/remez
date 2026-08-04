@@ -95,22 +95,32 @@ class DesignView extends StatelessWidget {
       child: CustomPaint(
         size: Size.infinite,
         painter: _DesignPainter(
-            fir: fir, iir: iir, palette: DesignPalette.of(Theme.of(context))),
+            fir: fir,
+            iir: iir,
+            palette: DesignPalette.of(Theme.of(context)),
+            fontFamily: Theme.of(context).textTheme.bodySmall?.fontFamily),
       ),
     );
   }
 }
 
 class _DesignPainter extends CustomPainter {
-  _DesignPainter({required this.fir, required this.iir, required this.palette});
+  _DesignPainter(
+      {required this.fir,
+      required this.iir,
+      required this.palette,
+      required this.fontFamily});
 
   final fc.RemezResult? fir;
   final ic.IIRResult? iir;
   final DesignPalette palette;
 
+  /// Named explicitly; a painter inherits no text style of its own.
+  final String? fontFamily;
+
   @override
   void paint(Canvas canvas, Size size) {
-    final c = _Sheet(canvas, size, palette);
+    final c = _Sheet(canvas, size, palette, fontFamily);
     if (iir != null) {
       _drawIir(c, iir!);
     } else if (fir != null) {
@@ -120,7 +130,10 @@ class _DesignPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _DesignPainter old) =>
-      old.fir != fir || old.iir != iir || old.palette != palette;
+      old.fir != fir ||
+      old.iir != iir ||
+      old.palette != palette ||
+      old.fontFamily != fontFamily;
 }
 
 /// A rectangle of the unit sheet, with y running *up* from [y0].
@@ -141,10 +154,11 @@ class _Box {
 
 /// The drawing surface: a unit box mapped onto the canvas, plus the symbols.
 class _Sheet {
-  _Sheet(this.canvas, this.size, this.palette);
+  _Sheet(this.canvas, this.size, this.palette, this.fontFamily);
   final Canvas canvas;
   final Size size;
   final DesignPalette palette;
+  final String? fontFamily;
 
   Offset at(double u, double v) => Offset(u * size.width, (1 - v) * size.height);
 
@@ -301,7 +315,9 @@ class _Sheet {
   TextPainter _layout(String value, double fontSize, Color colour) =>
       TextPainter(
         text: TextSpan(
-            text: value, style: TextStyle(color: colour, fontSize: fontSize)),
+            text: value,
+            style: TextStyle(
+                color: colour, fontSize: fontSize, fontFamily: fontFamily)),
         textDirection: TextDirection.ltr,
         textAlign: TextAlign.center,
       )..layout();
