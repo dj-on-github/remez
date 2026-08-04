@@ -12,6 +12,16 @@
 .swiftpm/
 migrate_working_dir/
 
+# old pythons working dirs
+python_prototype/C_code.zip
+python_prototype/RTL
+python_prototype/build
+python_prototype/dist
+python_prototype/filter.c
+python_prototype/hw_fir_41tap.sv
+python_prototype/hw_iir_12tap.sv
+python_prototype/remez.spec
+
 # IntelliJ related
 *.iml
 *.ipr

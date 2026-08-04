@@ -766,7 +766,7 @@ class _FieldState extends State<_Field> {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: widget.width,
+      width: math.max(widget.width, _widthForLabel(context, widget.label)),
       child: Focus(
         onFocusChange: (has) {
           if (!has) widget.onSubmitted(text.text);
@@ -786,6 +786,33 @@ class _FieldState extends State<_Field> {
     );
   }
 }
+
+/// How wide a field has to be for its label to be readable.
+///
+/// A floating label is laid out at full size and then scaled onto the border;
+/// given less room than it needs it is ellipsised, and a control labelled
+/// "Passban…" has stopped saying what it is. So the requested width is a
+/// minimum, and a long label widens its own field rather than losing its tail.
+///
+/// The decorator hands the label `(width - padding) / scale`, which is why the
+/// two constants below invert that. They are Material's, not ours, so
+/// `field_labels_test.dart` checks the result rather than trusting the sum:
+/// it asks each rendered label whether it was cut off.
+double _widthForLabel(BuildContext context, String label) {
+  final style = Theme.of(context).textTheme.bodyLarge ??
+      const TextStyle(fontSize: 16);
+  final painter = TextPainter(
+    text: TextSpan(text: label, style: style),
+    textDirection: TextDirection.ltr,
+  )..layout();
+  return painter.width * _labelScale + _labelPadding;
+}
+
+/// What the decorator shrinks a floating label to, and the room it takes
+/// around it: 12 of content padding each side, and 4 of gap either side of the
+/// label where it interrupts the border.
+const double _labelScale = 0.75;
+const double _labelPadding = 32;
 
 /// A checkbox sized and framed like a [_Field], so it sits in the same Wrap.
 class _Toggle extends StatelessWidget {

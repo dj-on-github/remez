@@ -171,7 +171,9 @@ void main() {
   });
 
   testWidgets('the button is there and needs a filter', (tester) async {
-    final c = await _open(tester);
+    // Tall enough for the File panel to be built: the control column is a
+    // ListView, so a panel below the fold does not exist to be found.
+    final c = await _open(tester, window: const Size(1200, 1500));
     ButtonStyleButton button() => tester.widget<OutlinedButton>(
         find.widgetWithText(OutlinedButton, 'Save plot…'));
     expect(button().onPressed, isNotNull);
