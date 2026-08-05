@@ -1,13 +1,23 @@
 /// The design state behind the UI: what has been asked for, and what came back.
 library;
 
+import 'dart:convert';
 import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
 
+import 'complex.dart';
+import 'datapath.dart' as dp;
 import 'fir_core.dart' as fir;
+import 'fir_ls.dart';
 import 'fixed_point.dart' as fx;
 import 'iir_core.dart' as iir;
 import 'labels.dart';
+import 'multirate.dart';
+import 'response.dart';
+import 'roots.dart';
+import 'signals.dart';
+import 'rtl_common.dart';
 
 enum Mode { fir, iir }
 
@@ -33,6 +43,9 @@ enum Appearance { system, light, dark }
 /// Named for the pane rather than the view because Flutter already has a
 /// `View`, and importing both into `main.dart` is ambiguous.
 enum Pane { plot, design }
+
+/// Which direction a polyphase rate change goes.
+enum RateChange { decimate, interpolate }
 
 class IirModel {
   const IirModel(this.approximation, this.response, this.verified);
@@ -93,6 +106,19 @@ class DesignController extends ChangeNotifier {
   int numtaps = 41;
   fir.Symmetry symmetry = fir.Symmetry.symmetric;
 
+  /// Which design method runs.
+  ///
+  /// The exchange is the default because minimax is what a specification
+  /// usually means. The other two are here because it is not always: least
+  /// squares when total error matters more than the worst of it, and the
+  /// window method when a predictable answer with no iteration is worth more
+  /// than an optimal one.
+  FirMethod method = FirMethod.remez;
+  FirWindow window = FirWindow.hamming;
+
+  /// The Kaiser window's shape parameter, which sets its attenuation.
+  String kaiserBeta = '8.6';
+
   /// Dense-grid points per basis coefficient.
   ///
   /// The exchange only ever sees the response on this grid, so a thin one can
@@ -109,6 +135,28 @@ class DesignController extends ChangeNotifier {
     BandRow('0', '0.2', '1', '1', '1', '0.5'),
     BandRow('0.25', '0.5', '0', '0', '10', '50'),
   ];
+
+  /// Design a half-band filter: alternate taps exactly zero, for half the
+  /// multiplies.
+  ///
+  /// Constrains rather than post-processes. The band table collapses to one
+  /// edge -- the stopband is its mirror about the quarter-rate point -- the
+  /// weights are equal, and the length is rounded to 4k+3, because those are
+  /// the conditions under which the answer is a half-band filter at all.
+  bool halfBand = false;
+
+  /// The half-band passband edge, in sample-rate units.
+  String halfBandEdge = '0.2';
+
+  /// Rate change factor, for the polyphase decomposition. 1 is no rate change.
+  int rateFactor = 1;
+
+  /// Which way the rate change goes.
+  ///
+  /// It makes no difference to the filter -- the same taps, split the same way
+  /// -- but it decides what the phases are wired to, and so what the exports
+  /// have to say about them.
+  RateChange rateChange = RateChange.decimate;
 
   /// Take the band weights from the Spec column rather than the Weight column.
   bool useSpec = false;
@@ -135,6 +183,20 @@ class DesignController extends ChangeNotifier {
   int fracBits = 15;
   int headroom = 2;
 
+  /// Measure the noise the generated datapath's own arithmetic adds.
+  ///
+  /// Off by default because it is not free: it drives the exact integer
+  /// datapath with a few thousand samples and takes a spectrum of the error
+  /// against the same filter computed exactly, which is tens of milliseconds
+  /// and has no business happening on every keystroke.
+  bool measureNoise = false;
+
+  /// Shade the spread of responses half an LSB of coefficient error covers.
+  ///
+  /// Also not free, and for the same reason: it is a few hundred filters
+  /// evaluated rather than one.
+  bool showSensitivity = false;
+
   // --- what the hardware export should build ---
   /// Coefficients baked into the RTL as constants, rather than driven in.
   bool fixedCoeffs = true;
@@ -145,6 +207,21 @@ class DesignController extends ChangeNotifier {
   bool logScale = true;
   Pane view = Pane.plot;
   Appearance appearance = Appearance.system;
+
+  /// Which of the optional plots are drawn.
+  ///
+  /// Phase is off to start with because group delay is its derivative and says
+  /// the same thing without the 2*pi steps; the other two are on because they
+  /// are the plots that answer a question the magnitude cannot.
+  /// Push a test signal through the filter and plot what comes out.
+  bool showSignal = false;
+  TestSignal testSignal = TestSignal.chirp;
+  String signalFrequency = '0.05';
+  int signalLength = 512;
+
+  bool showPhase = false;
+  bool showGroupDelay = true;
+  bool showZPlane = true;
 
   // --- what came back ---
   fir.RemezResult? firResult;
@@ -166,8 +243,127 @@ class DesignController extends ChangeNotifier {
   int get edgeCount => (response == 'bandpass' || response == 'bandstop') ? 2 : 1;
 
   void update(void Function() change) {
+    if (_restoring) {
+      change();
+      design();
+      return;
+    }
+    // Compared before and after the change rather than against the last
+    // snapshot: a text field commits on every blur, so most of what arrives
+    // here sets a value to what it already was, and recording that would make
+    // undo appear to do nothing.
+    //
+    // Taken before `design()` runs, so what is compared is what was asked
+    // for. The design's own consequences -- an auto-chosen order, a tap count
+    // rounded to a half-band length -- are not changes anyone made.
+    final before = toJson();
     change();
+    if (!_sameState(before, toJson())) {
+      _past.add(before);
+      if (_past.length > _historyLimit) _past.removeAt(0);
+      _future.clear();
+    }
     design();
+  }
+
+  // --- undo, redo and pinning -----------------------------------------------
+
+  /// Snapshots of the state before each change, newest last.
+  ///
+  /// Built on [toJson] rather than on a list of edits: the file format already
+  /// captures everything the program can be asked for, so anything that
+  /// survives a save survives an undo, and nothing has to be added here when a
+  /// new control is added anywhere else.
+  final List<Map<String, dynamic>> _past = [];
+  final List<Map<String, dynamic>> _future = [];
+
+  /// Set while a snapshot is being restored, so the restore does not record
+  /// itself as another change to undo.
+  bool _restoring = false;
+
+  static const int _historyLimit = 100;
+
+  bool get canUndo => _past.isNotEmpty;
+  bool get canRedo => _future.isNotEmpty;
+
+  void undo() {
+    if (_past.isEmpty) return;
+    _future.add(toJson());
+    _restore(_past.removeLast());
+  }
+
+  void redo() {
+    if (_future.isEmpty) return;
+    _past.add(toJson());
+    _restore(_future.removeLast());
+  }
+
+  void _restore(Map<String, dynamic> state) {
+    _restoring = true;
+    try {
+      fromJson(state);
+    } finally {
+      _restoring = false;
+    }
+  }
+
+  bool _sameState(Map<String, dynamic> a, Map<String, dynamic> b) =>
+      json.encode(a) == json.encode(b);
+
+  /// A design kept on the axes while another is edited against it.
+  Map<String, dynamic>? _pinnedState;
+
+  /// What the pinned design was, in a few words, for the legend.
+  String? pinnedLabel;
+
+  bool get hasPinned => _pinnedState != null;
+
+  /// Keep the current design on the plot while the next one is edited.
+  void pin() {
+    _pinnedState = toJson();
+    pinnedLabel = describe();
+    _pinnedCurve = null;
+    notifyListeners();
+  }
+
+  void unpin() {
+    _pinnedState = null;
+    pinnedLabel = null;
+    _pinnedCurve = null;
+    notifyListeners();
+  }
+
+  /// The pinned design's magnitude, on the current axes.
+  ///
+  /// Recomputed from the saved state rather than from a stored curve, so that
+  /// changing the sample rate or switching to a linear axis moves the pinned
+  /// trace with everything else instead of leaving it where it was drawn.
+  ({Float64List f, Float64List y})? pinnedMagnitude({int points = 1024}) {
+    if (_pinnedState == null) return null;
+    if (_pinnedCurve != null) return _pinnedCurve;
+    try {
+      final scratch = DesignController()
+        ..logScale = logScale
+        ..fromJson(_pinnedState!);
+      if (!scratch.hasResult) return null;
+      scratch.logScale = logScale;
+      return _pinnedCurve = scratch.magnitude(points: points);
+    } catch (_) {
+      // A pinned state that no longer designs is not worth an error on screen;
+      // it simply stops being drawn.
+      return null;
+    }
+  }
+
+  ({Float64List f, Float64List y})? _pinnedCurve;
+
+  /// The design in a few words, for a legend or a window title.
+  String describe() {
+    if (isIir) {
+      return '${labelOf(approximation)} $response, order $order';
+    }
+    return 'FIR N=$numtaps, ${method.label}'
+        '${halfBand ? ', half band' : ''}';
   }
 
   /// Change the sample rate, carrying the band edges with it.
@@ -200,6 +396,12 @@ class DesignController extends ChangeNotifier {
   void design() {
     final watch = Stopwatch()..start();
     error = null;
+    _zplaneBuilt = _zplaneIdeal = null;
+    _noise = null;
+    noiseError = null;
+    _sensitivity = null;
+    _pinnedCurve = null;
+    _signalRun = null;
     try {
       if (isIir) {
         _designIir();
@@ -224,6 +426,10 @@ class DesignController extends ChangeNotifier {
   }
 
   void _designFir() {
+    if (halfBand) {
+      _designHalfBand();
+      return;
+    }
     final f1 = Float64List(rows.length);
     final f2 = Float64List(rows.length);
     final d1 = Float64List(rows.length);
@@ -255,13 +461,72 @@ class DesignController extends ChangeNotifier {
                 ? fir.WeightKind.inverseF
                 : fir.WeightKind.constant)
     ];
-    firResult = fir.design(numtaps, bands,
-        symmetry: symmetry,
-        fs: fs,
-        gridDensity: gridDensity,
-        maxiter: maxiter);
+    firResult = _run(bands);
     firEffective = firResult;
     iirResult = iirEffective = null;
+  }
+
+  /// Hand the bands to whichever method is selected.
+  fir.RemezResult _run(List<fir.Band> bands) {
+    switch (method) {
+      case FirMethod.remez:
+        return fir.design(numtaps, bands,
+            symmetry: symmetry,
+            fs: fs,
+            gridDensity: gridDensity,
+            maxiter: maxiter);
+      case FirMethod.leastSquares:
+        return designLeastSquares(numtaps, bands,
+            symmetry: symmetry, fs: fs, gridDensity: gridDensity);
+      case FirMethod.window:
+        final beta = double.tryParse(kaiserBeta);
+        if (beta == null || beta < 0) {
+          throw fir.RemezError('the Kaiser beta must be a number, and not '
+              'negative');
+        }
+        return designWindowed(numtaps, bands,
+            symmetry: symmetry,
+            fs: fs,
+            gridDensity: gridDensity,
+            window: window,
+            kaiserBeta: beta);
+    }
+  }
+
+  /// Design the half-band case, where almost everything is fixed for you.
+  ///
+  /// The length is rounded up to the nearest 4k+3 rather than rejected: the
+  /// Taps field is a number someone typed, and refusing three lengths out of
+  /// every four would make it unusable. What it was rounded to is in the
+  /// report.
+  void _designHalfBand() {
+    final fp = double.tryParse(halfBandEdge);
+    if (fp == null) {
+      throw fir.RemezError('the half-band edge must be a number');
+    }
+    numtaps = nearestHalfBandLength(numtaps);
+    symmetry = fir.Symmetry.symmetric;
+    specDev = null;
+    final res = _run(halfBandBands(fp, fs: fs));
+    // What the exchange leaves at 1e-16 is zero, and a tap stored as 1e-16
+    // still costs a multiplier. Recorded first, because snapping destroys the
+    // evidence of how close the design came.
+    halfBandMiss = halfBandResidual(res.h);
+    firResult = fir.withTaps(res, snapHalfBand(res.h));
+    firEffective = firResult;
+    iirResult = iirEffective = null;
+  }
+
+  /// How far the taps that should have vanished actually were from zero,
+  /// relative to the centre tap, before they were snapped.
+  double halfBandMiss = 0.0;
+
+  /// The rate-change phases of the filter as built, or null when there is no
+  /// rate change to decompose for.
+  List<Float64List>? phases() {
+    if (isIir || rateFactor < 2) return null;
+    final res = firEffective;
+    return res == null ? null : polyphase(res.h, rateFactor);
   }
 
   /// Turn each band's dB spec into a deviation, and overwrite [weights].
@@ -573,6 +838,38 @@ class DesignController extends ChangeNotifier {
     return math.max(math.min(db - 15.0, -20.0), -220.0);
   }
 
+  /// The deepest stopband the design achieves, in dB, or null if it has none.
+  ///
+  /// What the arithmetic noise has to be compared against: a stopband below
+  /// the noise floor is a number on a plot rather than a filter you can build.
+  double? _deepestStopband() {
+    if (isIir) return -iirEffective!.achievedRs;
+    final res = firEffective;
+    if (res == null) return null;
+    var deepest = double.infinity;
+    for (var i = 0; i < res.bands.length; i++) {
+      if (res.bands[i].target > 1e-12) continue;
+      final level = _db(res.bandDeviation[i]);
+      if (level < deepest) deepest = level;
+    }
+    return deepest.isFinite ? deepest : null;
+  }
+
+  /// Whether [f] falls in a band the design is holding down.
+  bool _inStopband(double f) {
+    if (isIir) {
+      for (final range in iirEffective!.stopbandRanges) {
+        if (f >= range[0] && f <= range[1]) return true;
+      }
+      return false;
+    }
+    for (final band in firEffective?.bands ?? const <fir.Band>[]) {
+      if (band.target > 1e-12) continue;
+      if (f >= band.f1 && f <= band.f2) return true;
+    }
+    return false;
+  }
+
   /// Kaiser's order estimate over the narrowest transition band.
   ///
   /// A missed spec is usually just too few taps, and this is the number to try
@@ -628,6 +925,316 @@ class DesignController extends ChangeNotifier {
           if (b.target > 1e-12) b
       ];
 
+  /// How much of the response a half-LSB of coefficient error can move.
+  ///
+  /// Every coefficient is nudged independently by a uniform draw of up to half
+  /// a step either way -- the most a differently-rounded implementation of the
+  /// same design could be out by -- and the pointwise extremes of the
+  /// resulting magnitude responses are the envelope.
+  ///
+  /// A design whose envelope is a thin line has margin. One whose envelope
+  /// swallows the stopband is balanced on the exact values it was given, and
+  /// will not survive being built. For an IIR it can be worse than that, which
+  /// is what [unstable] counts: perturbations that put a pole on or outside
+  /// the unit circle.
+  ///
+  /// The draws are seeded, so the shading does not shimmer from one rebuild to
+  /// the next while nothing has changed.
+  ({Float64List f, Float64List lo, Float64List hi, int unstable, int trials})?
+      sensitivity({int points = 512, int trials = 128}) {
+    if (!showSensitivity || fixed == null || !hasResult) return null;
+    if (_sensitivity != null) return _sensitivity;
+
+    final f = Float64List(points);
+    final nyq = fs / 2;
+    for (var i = 0; i < points; i++) {
+      f[i] = nyq * i / (points - 1);
+    }
+    final w = Float64List(points);
+    for (var i = 0; i < points; i++) {
+      w[i] = 2 * math.pi * f[i] / fs;
+    }
+
+    final lo = Float64List(points)..fillRange(0, points, double.infinity);
+    final hi = Float64List(points)
+      ..fillRange(0, points, double.negativeInfinity);
+    final rng = math.Random(20240804);
+    final step = fixed!.step;
+    var unstable = 0;
+
+    for (var t = 0; t < trials; t++) {
+      // The first draw is no perturbation at all. Zero error is a member of
+      // the set being sampled, and including it explicitly is the only way a
+      // finite number of draws is guaranteed to cover the design it is drawn
+      // around: at a null, every jittered filter moves its zero off the exact
+      // frequency the nominal one nulls at, and the envelope would sit above
+      // the very curve it is supposed to bound.
+      final amount = t == 0 ? 0.0 : step;
+      Float64List magnitude;
+      if (isIir) {
+        final rows = <Float64List>[];
+        for (final row in fx.sosRows(fixed!)) {
+          final jittered = Float64List.fromList(row);
+          // a0 is not a multiplier and is exactly one in the hardware, so it
+          // has no rounding error to model.
+          for (final c in fx.sosLiveColumns) {
+            jittered[c] += (rng.nextDouble() - 0.5) * amount;
+          }
+          rows.add(jittered);
+        }
+        var radius = 0.0;
+        for (final p in iir.sosToZpk(rows).p) {
+          if (p.abs > radius) radius = p.abs;
+        }
+        if (radius >= 1.0) {
+          unstable++;
+          continue; // its response is unbounded; it would swamp the envelope
+        }
+        final h = iir.sosFreqz(rows, w);
+        magnitude = Float64List(points);
+        for (var i = 0; i < points; i++) {
+          magnitude[i] = h[i].abs;
+        }
+      } else {
+        final taps = Float64List.fromList(fixed!.values);
+        for (var k = 0; k < taps.length; k++) {
+          taps[k] += (rng.nextDouble() - 0.5) * amount;
+        }
+        final amp = fir.amplitudeResponse(taps, w, symmetry);
+        magnitude = Float64List(points);
+        for (var i = 0; i < points; i++) {
+          magnitude[i] = amp[i].abs();
+        }
+      }
+      for (var i = 0; i < points; i++) {
+        final y = logScale ? _db(magnitude[i]) : magnitude[i];
+        if (y < lo[i]) lo[i] = y;
+        if (y > hi[i]) hi[i] = y;
+      }
+    }
+
+    if (unstable == trials) {
+      // Nothing to draw, but the count is the finding.
+      return _sensitivity =
+          (f: f, lo: Float64List(0), hi: Float64List(0),
+              unstable: unstable, trials: trials);
+    }
+    return _sensitivity =
+        (f: f, lo: lo, hi: hi, unstable: unstable, trials: trials);
+  }
+
+  ({Float64List f, Float64List lo, Float64List hi, int unstable, int trials})?
+      _sensitivity;
+
+  /// What the datapath's arithmetic adds to the output, measured.
+  ///
+  /// Null when the measurement is switched off, when the arithmetic is
+  /// floating point and there is nothing to measure, or when the datapath
+  /// cannot be built at all -- in which case [noiseError] says why, in the same
+  /// words the export button would have used.
+  ///
+  /// A coefficient set can be rounded to a filter whose response is still
+  /// exactly what was asked for and whose hardware still cannot reach it: the
+  /// sums and products are rounded too, and that noise sits at some level of
+  /// its own. Where the stopband is deeper than that level, the stopband is not
+  /// what the filter will actually deliver.
+  dp.NoiseFloor? noiseFloor() {
+    if (!measureNoise || fixed == null || !hasResult) return null;
+    if (_noise != null || noiseError != null) return _noise;
+    try {
+      // Structure and folding are FIR options: a cascade of biquads has no
+      // adder tree to choose and nothing to fold, and `simulateIir` ignores
+      // both, so passing them through would only trip the planner's check.
+      final options = RtlOptions(
+        headroom: headroom,
+        fixedCoeffs: fixedCoeffs,
+        structure: isIir ? 'chain' : structure,
+        folded: !isIir && folded,
+      );
+      final plan = isIir
+          ? planFor('iir', iirResult!, fixed!, options)
+          : planFor('fir', firResult!, fixed!, options);
+      final rows = isIir ? fx.sosRows(fixed!) : const <Float64List>[];
+      final taps = fixed!.values;
+      _noise = dp.noiseResponse(
+        plan.simulate,
+        (x) => isIir ? iir.sosFilter(rows, x) : _convolve(taps, x),
+        fixed!.fracBits,
+        fixed!.bits,
+        headroom,
+        // Four thousand samples put the median within a few tenths of a dB of
+        // where sixteen thousand put it, at a quarter of the wait.
+        length: 1 << 12,
+      );
+    } on RtlError catch (e) {
+      noiseError = e.message;
+    } on dp.DatapathError catch (e) {
+      noiseError = e.message;
+    }
+    return _noise;
+  }
+
+  dp.NoiseFloor? _noise;
+
+  /// Why there is no measurement, when there should have been one.
+  String? noiseError;
+
+  /// Phase in degrees and group delay in samples, over the same grid.
+  ///
+  /// Returned together because both come out of one pass over the response and
+  /// the two plots share an x axis.
+  ///
+  /// The delay is masked wherever the response is essentially null: there it is
+  /// a ratio of two quantities that have both gone to zero, and the noise that
+  /// falls out of that would put spikes on a plot whose whole message, for a
+  /// linear-phase filter, is that the line is flat.
+  ({Float64List f, Float64List phase, Float64List delay})? phaseAndDelay(
+      {int points = 1024, bool ideal = false}) {
+    if (ideal && fixed == null) return null;
+    final f = Float64List(points);
+    final w = Float64List(points);
+    final nyq = fs / 2;
+    for (var i = 0; i < points; i++) {
+      f[i] = nyq * i / (points - 1);
+      w[i] = 2 * math.pi * f[i] / fs;
+    }
+
+    final List<Complex> h;
+    final Float64List tau;
+    if (isIir) {
+      final res = ideal ? iirResult : iirEffective;
+      if (res == null) return null;
+      h = iir.sosFreqz(res.sos, w);
+      tau = sosGroupDelay(res.sos, w);
+    } else {
+      final res = ideal ? firResult : firEffective;
+      if (res == null) return null;
+      h = firFreqz(res.h, w);
+      tau = polyGroupDelay(res.h, w);
+    }
+
+    final raw = Float64List(points);
+    var peak = 0.0;
+    for (var i = 0; i < points; i++) {
+      raw[i] = h[i].arg;
+      final m = h[i].abs;
+      if (m > peak) peak = m;
+    }
+    final floor = peak * 1e-7;
+
+    final phase = unwrap(raw);
+    for (var i = 0; i < points; i++) {
+      phase[i] *= 180 / math.pi;
+      if (h[i].abs < floor) tau[i] = double.nan;
+    }
+    return (f: f, phase: phase, delay: tau);
+  }
+
+  /// Push a test signal through the filter, in both arithmetics.
+  ///
+  /// The float path is the design as designed. The fixed path is the exact
+  /// integer datapath the exports would generate, run on the same samples and
+  /// scaled back to the input's units, so the two can be drawn on one axis and
+  /// the gap between them read off directly.
+  SignalRun? signalRun() {
+    if (!showSignal || !hasResult) return null;
+    if (_signalRun != null) return _signalRun;
+
+    final frequency = double.tryParse(signalFrequency) ?? 0.05;
+    final n = signalLength.clamp(16, 8192);
+    final x = generate(testSignal, n, fs: fs, frequency: frequency);
+    final y = isIir
+        ? iir.sosFilter(iirEffective!.sos, x)
+        : convolve(firEffective!.h, x);
+
+    Float64List? quantized;
+    var clipped = 0;
+    final q = fixed;
+    if (q != null && q.fracBits >= 0) {
+      try {
+        final plan = planFor(
+          isIir ? 'iir' : 'fir',
+          isIir ? iirResult! : firResult!,
+          q,
+          RtlOptions(
+            headroom: headroom,
+            fixedCoeffs: fixedCoeffs,
+            structure: isIir ? 'chain' : structure,
+            folded: !isIir && folded,
+          ),
+        );
+        final scale = math.pow(2.0, q.fracBits).toDouble();
+        final limit = (1 << (q.bits + headroom - 1)) - 1;
+        final samples = [
+          for (final v in x) (v * scale).round().clamp(-limit - 1, limit)
+        ];
+        final out = plan.simulate(samples);
+        quantized = Float64List(out.length);
+        for (var i = 0; i < out.length; i++) {
+          quantized[i] = out[i] / scale;
+          if (out[i] >= limit || out[i] <= -limit - 1) clipped++;
+        }
+      } catch (_) {
+        // A datapath that cannot be built has nothing to run; the float trace
+        // is still worth showing on its own.
+        quantized = null;
+      }
+    }
+
+    return _signalRun = SignalRun(
+      input: x,
+      output: y,
+      fixedOutput: quantized,
+      clipped: clipped,
+    );
+  }
+
+  SignalRun? _signalRun;
+
+  /// Where the transfer function goes to zero and to infinity.
+  ///
+  /// [ideal] asks for the design before its coefficients were rounded, and is
+  /// null unless fixed point is on: with nothing to compare against, drawing
+  /// the same points twice says nothing.
+  ///
+  /// An FIR's poles are the N-1 at the origin that its delay line puts there.
+  /// They are returned rather than left implicit so the plot can count them.
+  ({List<Complex> zeros, List<Complex> poles, bool converged})? zplane(
+      {bool ideal = false}) {
+    if (ideal && fixed == null) return null;
+    final cached = ideal ? _zplaneIdeal : _zplaneBuilt;
+    if (cached != null) return cached;
+
+    ({List<Complex> zeros, List<Complex> poles, bool converged})? value;
+    if (isIir) {
+      // Already known: an IIR is designed from its poles and zeros, and
+      // re-analysing the rounded sections recovers where they moved to.
+      final res = ideal ? iirResult : iirEffective;
+      if (res != null) value = (zeros: res.z, poles: res.p, converged: true);
+    } else {
+      final res = ideal ? firResult : firEffective;
+      if (res != null) {
+        final found = polynomialRoots(res.h.toList());
+        value = (
+          zeros: found.values,
+          poles: List<Complex>.filled(res.h.length - 1, Complex.zero),
+          converged: found.converged,
+        );
+      }
+    }
+    if (ideal) {
+      _zplaneIdeal = value;
+    } else {
+      _zplaneBuilt = value;
+    }
+    return value;
+  }
+
+  /// Root finding is quadratic in the tap count and the plot asks on every
+  /// rebuild, so the answer is held until the next design replaces it.
+  ({List<Complex> zeros, List<Complex> poles, bool converged})? _zplaneBuilt;
+  ({List<Complex> zeros, List<Complex> poles, bool converged})? _zplaneIdeal;
+
   /// The impulse response, for the bottom panel.
   Float64List impulse({int max = 256}) {
     if (isIir) {
@@ -656,9 +1263,16 @@ class DesignController extends ChangeNotifier {
       ...(_passenger['display'] as Map<String, dynamic>? ?? const {}),
       'log_scale': logScale,
       'view': view == Pane.design ? 'Design view' : 'Plot view',
-      // Not a key the Python writes; it ignores what it does not know, and
-      // this program preserves what it does, so the two still interchange.
+      // Not keys the Python writes; it ignores what it does not know, and this
+      // program preserves what it does, so the two still interchange.
       'appearance': appearance.name,
+      'phase': showPhase,
+      'signal': showSignal,
+      'signal_kind': testSignal.name,
+      'signal_frequency': signalFrequency,
+      'signal_length': signalLength,
+      'group_delay': showGroupDelay,
+      'zplane': showZPlane,
     };
     return {
       'format': formatName,
@@ -671,6 +1285,13 @@ class DesignController extends ChangeNotifier {
         'grid_density': gridDensity,
         'maxiter': maxiter,
         'use_spec': useSpec,
+        'method': method.name,
+        'window': window.name,
+        'kaiser_beta': kaiserBeta,
+        'half_band': halfBand,
+        'half_band_edge': halfBandEdge,
+        'rate_factor': rateFactor,
+        'rate_change': rateChange.name,
         'bands': [
           for (final r in rows)
             [
@@ -707,6 +1328,8 @@ class DesignController extends ChangeNotifier {
         'structure': structure,
         'folded': folded,
         'testbench': wantTestbench,
+        'measure_noise': measureNoise,
+        'sensitivity': showSensitivity,
       },
       'display': display,
     };
@@ -737,6 +1360,19 @@ class DesignController extends ChangeNotifier {
     gridDensity = read<num>(firState, 'grid_density')?.toInt() ?? gridDensity;
     maxiter = read<num>(firState, 'maxiter')?.toInt() ?? maxiter;
     useSpec = read<bool>(firState, 'use_spec') ?? useSpec;
+    final methodName = read<String>(firState, 'method');
+    method = FirMethod.values
+        .firstWhere((m) => m.name == methodName, orElse: () => method);
+    final windowName = read<String>(firState, 'window');
+    window = FirWindow.values
+        .firstWhere((w) => w.name == windowName, orElse: () => window);
+    kaiserBeta = _asText(firState?['kaiser_beta']) ?? kaiserBeta;
+    halfBand = read<bool>(firState, 'half_band') ?? halfBand;
+    halfBandEdge = _asText(firState?['half_band_edge']) ?? halfBandEdge;
+    rateFactor = read<num>(firState, 'rate_factor')?.toInt() ?? rateFactor;
+    final direction = read<String>(firState, 'rate_change');
+    rateChange = RateChange.values
+        .firstWhere((r) => r.name == direction, orElse: () => rateChange);
     final sym = read<String>(firState, 'symmetry');
     if (sym == 'antisymmetric') {
       symmetry = fir.Symmetry.antisymmetric;
@@ -795,6 +1431,8 @@ class DesignController extends ChangeNotifier {
     structure = read<String>(arith, 'structure') ?? structure;
     folded = read<bool>(arith, 'folded') ?? folded;
     wantTestbench = read<bool>(arith, 'testbench') ?? wantTestbench;
+    measureNoise = read<bool>(arith, 'measure_noise') ?? measureNoise;
+    showSensitivity = read<bool>(arith, 'sensitivity') ?? showSensitivity;
 
     final display = state['display'] as Map<String, dynamic>?;
     logScale = read<bool>(display, 'log_scale') ?? logScale;
@@ -804,6 +1442,15 @@ class DesignController extends ChangeNotifier {
     final look = read<String>(display, 'appearance');
     appearance = Appearance.values.firstWhere((a) => a.name == look,
         orElse: () => appearance);
+    showPhase = read<bool>(display, 'phase') ?? showPhase;
+    showSignal = read<bool>(display, 'signal') ?? showSignal;
+    final kind = read<String>(display, 'signal_kind');
+    testSignal = TestSignal.values
+        .firstWhere((s) => s.name == kind, orElse: () => testSignal);
+    signalFrequency = _asText(display?['signal_frequency']) ?? signalFrequency;
+    signalLength = read<num>(display, 'signal_length')?.toInt() ?? signalLength;
+    showGroupDelay = read<bool>(display, 'group_delay') ?? showGroupDelay;
+    showZPlane = read<bool>(display, 'zplane') ?? showZPlane;
 
     final mode0 = read<String>(state, 'mode');
     if (mode0 != null) {
@@ -857,8 +1504,13 @@ class DesignController extends ChangeNotifier {
       final eff = firEffective!;
       b.writeln('type ${res.ftype}  (${res.symmetry.name}, '
           '${res.numtaps.isOdd ? 'odd' : 'even'} length ${res.numtaps})');
-      b.writeln('iterations       ${res.iterations}'
-          '${res.converged ? '' : '   *** did not converge ***'}');
+      b.writeln('method           ${method.label}'
+          "${method == FirMethod.window ? ', ${window.label} window'
+              '${window == FirWindow.kaiser ? ', beta $kaiserBeta' : ''}' : ''}");
+      if (method == FirMethod.remez) {
+        b.writeln('iterations       ${res.iterations}'
+            '${res.converged ? '' : '   *** did not converge ***'}');
+      }
       b.writeln('weighted delta   ${res.delta.abs().toStringAsExponential(5)}');
       b.writeln();
       b.writeln('band          range            deviation      dB');
@@ -873,6 +1525,39 @@ class DesignController extends ChangeNotifier {
             '${_trim(band.f1).padLeft(8)}-${_trim(band.f2).padRight(8)} '
             '${dev.toStringAsExponential(4).padLeft(12)}  $label');
       }
+      if (halfBand) {
+        final census = tapCensus(eff.h, res.symmetry, folded);
+        b.writeln();
+        b.writeln('half band, folded about ${_trim(fs / 4)}');
+        b.writeln('  length         ${res.numtaps}'
+            '${numtaps == res.numtaps ? '' : '   (rounded to 4k+3)'}');
+        b.writeln('  zero taps      ${census.taps - census.nonzero} of '
+            '${census.taps}, so ${census.multipliers} multipl'
+            '${census.multipliers == 1 ? 'y' : 'ies'}'
+            '${folded ? ' folded' : ''} instead of ${census.taps}');
+        b.writeln('  centre tap     ${eff.h[res.numtaps ~/ 2]}');
+        // How far the identity was from holding before the snap: small means
+        // the design converged, large means the length is not enough.
+        b.writeln('  snapped by     '
+            '${halfBandMiss.toStringAsExponential(2)} of the centre tap');
+      }
+
+      final phaseSet = phases();
+      if (phaseSet != null) {
+        final verb =
+            rateChange == RateChange.decimate ? 'decimate' : 'interpolate';
+        b.writeln();
+        b.writeln('polyphase, $verb by $rateFactor');
+        b.writeln('  ${phaseSet.length} phases of ${phaseSet.first.length} '
+            'taps each');
+        b.writeln('  ${(eff.h.length / rateFactor).ceil()} multiplies per '
+            '${rateChange == RateChange.decimate ? 'input' : 'output'} sample '
+            'instead of ${eff.h.length}');
+        for (var p = 0; p < phaseSet.length; p++) {
+          b.writeln('  e$p: ${phaseSet[p].map(_short).join('  ')}');
+        }
+      }
+
       final spec = specDev;
       if (spec != null) {
         b.writeln();
@@ -906,6 +1591,64 @@ class DesignController extends ChangeNotifier {
       }
       b.writeln('  datapath       ${q.bits + headroom} bits '
           '(Q${q.intBits + headroom}.${q.fracBits})');
+
+      final spread = sensitivity();
+      if (spread != null) {
+        b.writeln();
+        b.writeln('half an LSB of coefficient error, over '
+            '${spread.trials} draws');
+        if (spread.unstable > 0) {
+          b.writeln('  *** ${spread.unstable} of ${spread.trials} came out '
+              'unstable ***');
+          b.writeln('  the design sits too close to the unit circle to '
+              'survive being built');
+        }
+        if (spread.lo.isNotEmpty) {
+          final stop = _deepestStopband();
+          if (stop != null) {
+            // The worst the stopband gets anywhere it is supposed to be a
+            // stopband, over every draw.
+            var worst = double.negativeInfinity;
+            for (var i = 0; i < spread.f.length; i++) {
+              if (!_inStopband(spread.f[i])) continue;
+              final v = logScale ? spread.hi[i] : _db(spread.hi[i]);
+              if (v > worst) worst = v;
+            }
+            if (worst.isFinite) {
+              b.writeln('  stopband       ${stop.toStringAsFixed(2)} dB '
+                  'as built, ${worst.toStringAsFixed(2)} dB at worst');
+            }
+          }
+        }
+      }
+
+      final noise = noiseFloor();
+      if (noiseError != null) {
+        b.writeln();
+        b.writeln('arithmetic noise cannot be measured:');
+        b.writeln('  $noiseError');
+      } else if (noise != null) {
+        var worst = double.negativeInfinity;
+        for (final v in noise.noiseDb) {
+          if (v > worst) worst = v;
+        }
+        b.writeln();
+        b.writeln('arithmetic noise  (measured through the datapath'
+            '${isIir ? '' : ', $structure${folded ? ' folded' : ''}'})');
+        b.writeln('  error rms      ${noise.rmsLsb.toStringAsFixed(3)} LSB');
+        b.writeln('  noise floor    '
+            '${noise.medianDb.toStringAsFixed(2)} dB median, '
+            '${worst.toStringAsFixed(2)} dB worst');
+        // The number that decides whether the stopband on the plot is real.
+        final designed = _deepestStopband();
+        if (designed != null) {
+          final actual = dp.effectiveResponse(designed, noise.medianDb);
+          b.writeln('  stopband       ${designed.toStringAsFixed(2)} dB '
+              'designed, ${actual.toStringAsFixed(2)} dB with the noise'
+              '${actual > designed + 0.5 ? '   *** the arithmetic is the '
+                  'limit, not the filter ***' : ''}');
+        }
+      }
     }
     if (lastDesignTime != null) {
       b.writeln();
@@ -924,6 +1667,24 @@ class DesignController extends ChangeNotifier {
     return b.toString();
   }
 }
+
+/// Direct convolution, for the exactly-computed reference the measurement
+/// compares the integer datapath against.
+Float64List _convolve(Float64List taps, Float64List x) {
+  final out = Float64List(x.length);
+  for (var i = 0; i < x.length; i++) {
+    var acc = 0.0;
+    final upper = math.min(taps.length - 1, i);
+    for (var k = 0; k <= upper; k++) {
+      acc += taps[k] * x[i - k];
+    }
+    out[i] = acc;
+  }
+  return out;
+}
+
+/// A coefficient at a width that lines a phase up in the report.
+String _short(double v) => v.toStringAsFixed(9).padLeft(13);
 
 String _col(double v) => v.toStringAsFixed(9).padLeft(14);
 

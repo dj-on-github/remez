@@ -12,6 +12,8 @@ library;
 
 import 'fir_core.dart' as fir;
 import 'fixed_point.dart' as fx;
+import 'dart:typed_data';
+
 import 'format.dart';
 import 'iir_core.dart' as iir;
 import 'labels.dart';
@@ -26,7 +28,12 @@ String formatNote(fx.Fixed? fixed) => fixed == null
 bool wantsHeader(String path) => path.endsWith('.h');
 
 /// The impulse response, as CSV or as a C array.
-List<String> firExport(fir.RemezResult res, String path, {fx.Fixed? fixed}) {
+/// [phases] is the polyphase decomposition, when the filter is part of a rate
+/// change. It is written alongside the taps rather than instead of them: the
+/// phases are the same numbers regrouped, and which form is wanted depends on
+/// whether the reader is checking the design or building the hardware.
+List<String> firExport(fir.RemezResult res, String path,
+    {fx.Fixed? fixed, List<Float64List>? phases}) {
   final note = formatNote(fixed);
   if (wantsHeader(path)) {
     final lines = <String>[
@@ -50,6 +57,20 @@ List<String> firExport(fir.RemezResult res, String path, {fx.Fixed? fixed}) {
       '};',
       '',
     ]);
+    if (phases != null && phases.isNotEmpty) {
+      lines.addAll([
+        '/* Polyphase: phase p is taps p, p+M, p+2M, ...  Feeding each phase',
+        '   every Mth sample and summing computes only the outputs a',
+        '   decimator keeps, for 1/M of the multiplies. */',
+        '#define FIR_PHASES ${phases.length}',
+        '#define FIR_PHASE_TAPS ${phases.first.length}',
+        'static const double fir_phases[FIR_PHASES][FIR_PHASE_TAPS] = {',
+        for (final phase in phases)
+          '    {${phase.map((v) => formatG(v, precision: 17)).join(', ')}},',
+        '};',
+        '',
+      ]);
+    }
     return lines;
   }
 
@@ -64,6 +85,19 @@ List<String> firExport(fir.RemezResult res, String path, {fx.Fixed? fixed}) {
     var row = '$i,${formatG(res.h[i], precision: 17)}';
     if (fixed != null) row += ',${fixed.ints[i]}';
     lines.add(row);
+  }
+  if (phases != null && phases.isNotEmpty) {
+    lines.addAll([
+      '',
+      '# polyphase: phase p is taps p, p+${phases.length}, '
+          'p+${2 * phases.length}, ...',
+      'phase,k,h',
+    ]);
+    for (var p = 0; p < phases.length; p++) {
+      for (var k = 0; k < phases[p].length; k++) {
+        lines.add('$p,$k,${formatG(phases[p][k], precision: 17)}');
+      }
+    }
   }
   return lines;
 }

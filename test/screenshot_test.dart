@@ -107,7 +107,11 @@ void main() {
 
   testWidgets('the export buttons are on screen and enable when they can run',
       (tester) async {
-    tester.view.physicalSize = const Size(1500, 1400);
+    // Tall enough for the whole control column with the Arithmetic panel in
+    // its fixed-point form, which is the longest it gets. The point of the
+    // test is that the exports are reachable without hunting through a menu;
+    // it needs a window that can show the column to say that.
+    tester.view.physicalSize = const Size(1500, 1980);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
 
@@ -123,6 +127,8 @@ void main() {
       'Save design…',
       'Save coefficients…',
       'Save plot…',
+      'Save script…',
+      'Save integer C…',
       'Save C…',
       'Generate SV…',
       'Generate VHDL…',
@@ -138,6 +144,9 @@ void main() {
     expect(button('Save coefficients…').onPressed, isNotNull);
     expect(button('Save plot…').onPressed, isNotNull);
     expect(button('Save C…').onPressed, isNotNull);
+    expect(button('Save script…').onPressed, isNotNull);
+    // Integer C needs an integer datapath, which floating point has not got.
+    expect(button('Save integer C…').onPressed, isNull);
     expect(button('Generate SV…').onPressed, isNull);
     expect(button('Generate VHDL…').onPressed, isNull);
 
@@ -146,6 +155,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(button('Generate SV…').onPressed, isNotNull);
     expect(button('Generate VHDL…').onPressed, isNotNull);
+    expect(button('Save integer C…').onPressed, isNotNull);
 
     // A filter that will not design disables both of the exports.
     final state = tester.state<State<DesignerPage>>(find.byType(DesignerPage));

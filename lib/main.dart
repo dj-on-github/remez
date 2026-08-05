@@ -22,11 +22,16 @@ import 'src/labels.dart';
 import 'src/controller.dart';
 import 'src/design_view.dart';
 import 'src/fir_core.dart' as fir;
+import 'src/fir_ls.dart';
 import 'src/iir_core.dart' as iir;
+import 'src/int_c_export.dart';
 import 'src/plots.dart';
 import 'src/rtl_common.dart';
+import 'src/script_export.dart';
+import 'src/signals.dart';
 import 'src/sv_export.dart' as sv;
 import 'src/vhdl_export.dart' as vhdl;
+import 'src/zplane.dart';
 
 void main(List<String> args) {
   final cli = parseArgs(args);
@@ -183,10 +188,38 @@ class _DesignerPageState extends State<DesignerPage> {
 
   @override
   Widget build(BuildContext context) {
+    // Bound here rather than in a menu bar: the whole program is one window
+    // with one document, and these are the only two shortcuts it has.
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.keyZ, meta: true):
+            controller.undo,
+        const SingleActivator(LogicalKeyboardKey.keyZ, control: true):
+            controller.undo,
+        const SingleActivator(LogicalKeyboardKey.keyZ,
+            meta: true, shift: true): controller.redo,
+        const SingleActivator(LogicalKeyboardKey.keyZ,
+            control: true, shift: true): controller.redo,
+      },
+      child: Focus(autofocus: true, child: _scaffold(context)),
+    );
+  }
+
+  Widget _scaffold(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Digital filter designer'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.undo),
+            tooltip: 'Undo',
+            onPressed: controller.canUndo ? controller.undo : null,
+          ),
+          IconButton(
+            icon: const Icon(Icons.redo),
+            tooltip: 'Redo',
+            onPressed: controller.canRedo ? controller.redo : null,
+          ),
           Padding(
             padding: const EdgeInsets.only(right: 16),
             child: Center(
@@ -330,8 +363,7 @@ class _Controls extends StatelessWidget {
     if (file == null) return;
     // The file's own name is what the program calls itself in its usage and
     // error messages, until argv[0] says otherwise.
-    final stem = sanitiseName(
-        file.path.split(Platform.pathSeparator).last.replaceAll('.c', ''));
+    final stem = _stemOf(file.path);
     // Whatever was actually built: in fixed point that is the rounded filter.
     final source = controller.isIir
         ? iirCSource(controller.iirEffective!,
@@ -339,6 +371,63 @@ class _Controls extends StatelessWidget {
         : firCSource(controller.firEffective!,
             fixed: controller.fixed, name: stem);
     await _write(messenger, file.path, source);
+  }
+
+  /// The file's own name, as an identifier the generated source can use for
+  /// its function and its usage message.
+  String _stemOf(String path) {
+    final base = path.split(Platform.pathSeparator).last;
+    final dot = base.lastIndexOf('.');
+    return sanitiseName(dot > 0 ? base.substring(0, dot) : base);
+  }
+
+  /// A NumPy module or a MATLAB function, chosen by the extension.
+  Future<void> _saveScript(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    const type = XTypeGroup(
+        label: 'Python or MATLAB', extensions: ['py', 'm']);
+    final file = await getSaveLocation(
+        acceptedTypeGroups: const [type], suggestedName: 'filter.py');
+    if (file == null) return;
+    final language = scriptLanguageFor(file.path);
+    if (language == null) {
+      messenger.showSnackBar(const SnackBar(
+          content: Text('Name it .py for Python or .m for MATLAB')));
+      return;
+    }
+    final stem = _stemOf(file.path);
+    final source = controller.isIir
+        ? iirScript(controller.iirEffective!, language,
+            fixed: controller.fixed, name: stem)
+        : firScript(controller.firEffective!, language,
+            fixed: controller.fixed, name: stem);
+    await _write(messenger, file.path, source);
+  }
+
+  /// The same filter with no floating point in it, for a part with no FPU.
+  Future<void> _saveIntC(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    const type = XTypeGroup(label: 'C source', extensions: ['c']);
+    final file = await getSaveLocation(
+        acceptedTypeGroups: const [type], suggestedName: 'filter_int.c');
+    if (file == null) return;
+    final stem = _stemOf(file.path);
+    try {
+      final source = controller.isIir
+          ? iirIntCSource(controller.iirEffective!,
+              fixed: controller.fixed!,
+              headroom: controller.headroom,
+              name: stem)
+          : firIntCSource(controller.firEffective!,
+              fixed: controller.fixed!,
+              headroom: controller.headroom,
+              structure: controller.structure,
+              folded: controller.folded,
+              name: stem);
+      await _write(messenger, file.path, source);
+    } on IntCError catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text(e.message)));
+    }
   }
 
   /// The RTL, and its testbench beside it when one was asked for.
@@ -415,7 +504,8 @@ class _Controls extends StatelessWidget {
     // values, alongside the integers they are stored as.
     final lines = controller.isIir
         ? iirExport(controller.iirEffective!, file.path, fixed: controller.fixed)
-        : firExport(controller.firEffective!, file.path, fixed: controller.fixed);
+        : firExport(controller.firEffective!, file.path,
+          fixed: controller.fixed, phases: controller.phases());
     await _write(messenger, file.path, '${lines.join('\n')}\n');
   }
 
@@ -521,6 +611,31 @@ class _Controls extends StatelessWidget {
               const SizedBox(height: 6),
               Row(children: [
                 Expanded(
+                  child: Tooltip(
+                    message: 'A NumPy module or a MATLAB function, by the '
+                        'extension you give it: .py or .m',
+                    child: OutlinedButton(
+                      onPressed: c.hasResult ? () => _saveScript(context) : null,
+                      child: const Text('Save script…'),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Tooltip(
+                    message: _rtlHint(c),
+                    child: OutlinedButton(
+                      onPressed: c.hasResult && c.isFixed
+                          ? () => _saveIntC(context)
+                          : null,
+                      child: const Text('Save integer C…'),
+                    ),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 6),
+              Row(children: [
+                Expanded(
                   child: OutlinedButton(
                     onPressed: c.hasResult ? () => _saveC(context) : null,
                     child: const Text('Save C…'),
@@ -585,6 +700,37 @@ class _Controls extends StatelessWidget {
                 value: c.logScale,
                 onChanged: (v) => c.update(() => c.logScale = v),
               ),
+              for (final trace in [
+                ('Group delay', c.showGroupDelay,
+                    (bool v) => c.showGroupDelay = v),
+                ('Phase', c.showPhase, (bool v) => c.showPhase = v),
+                ('Poles and zeros', c.showZPlane, (bool v) => c.showZPlane = v),
+              ])
+                CheckboxListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  controlAffinity: ListTileControlAffinity.leading,
+                  title: Text(trace.$1),
+                  value: trace.$2,
+                  onChanged: (v) => c.update(() => trace.$3(v ?? false)),
+                ),
+              const SizedBox(height: 4),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: c.hasResult
+                      ? () => c.hasPinned ? c.unpin() : c.pin()
+                      : null,
+                  icon: Icon(
+                      c.hasPinned
+                          ? Icons.push_pin
+                          : Icons.push_pin_outlined,
+                      size: 16),
+                  label: Text(c.hasPinned
+                      ? 'Unpin ${c.pinnedLabel}'
+                      : 'Pin this design'),
+                ),
+              ),
               const SizedBox(height: 4),
               SegmentedButton<Appearance>(
                 showSelectedIcon: false,
@@ -606,6 +752,62 @@ class _Controls extends StatelessWidget {
                 onSelectionChanged: (v) =>
                     c.update(() => c.appearance = v.first),
               ),
+            ],
+          ),
+        ),
+        _Panel(
+          title: 'Signal',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              CheckboxListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                controlAffinity: ListTileControlAffinity.leading,
+                title: const Text('Run a signal through it'),
+                subtitle: const Text('and in fixed point, through the datapath',
+                    style: TextStyle(fontSize: 11)),
+                value: c.showSignal,
+                onChanged: (v) => c.update(() => c.showSignal = v ?? false),
+              ),
+              if (c.showSignal) ...[
+                DropdownButtonFormField<TestSignal>(
+                  initialValue: c.testSignal,
+                  isDense: true,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                      labelText: 'Signal',
+                      isDense: true,
+                      border: OutlineInputBorder()),
+                  items: [
+                    for (final t in TestSignal.values)
+                      DropdownMenuItem(value: t, child: Text(t.label))
+                  ],
+                  onChanged: (v) =>
+                      v == null ? null : c.update(() => c.testSignal = v),
+                ),
+                const SizedBox(height: 8),
+                Wrap(spacing: 8, runSpacing: 8, children: [
+                  _Field(
+                    label: 'Samples',
+                    value: '${c.signalLength}',
+                    width: 104,
+                    onSubmitted: (v) {
+                      final n = int.tryParse(v);
+                      if (n != null) c.update(() => c.signalLength = n);
+                    },
+                  ),
+                  if (c.testSignal == TestSignal.tone ||
+                      c.testSignal == TestSignal.square)
+                    _Field(
+                      label: 'Frequency',
+                      value: c.signalFrequency,
+                      width: 116,
+                      onSubmitted: (v) =>
+                          c.update(() => c.signalFrequency = v),
+                    ),
+                ]),
+              ],
             ],
           ),
         ),
@@ -913,6 +1115,54 @@ class _FirPanel extends StatelessWidget {
                 ),
               ]),
               const SizedBox(height: 8),
+              DropdownButtonFormField<FirMethod>(
+                initialValue: c.method,
+                isDense: true,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                    labelText: 'Method',
+                    isDense: true,
+                    border: OutlineInputBorder()),
+                items: [
+                  for (final m in FirMethod.values)
+                    DropdownMenuItem(value: m, child: Text(m.label))
+                ],
+                onChanged: (v) =>
+                    v == null ? null : c.update(() => c.method = v),
+              ),
+              if (c.method == FirMethod.window) ...[
+                const SizedBox(height: 8),
+                DropdownButtonFormField<FirWindow>(
+                  initialValue: c.window,
+                  isDense: true,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                      labelText: 'Window',
+                      isDense: true,
+                      border: OutlineInputBorder()),
+                  items: [
+                    for (final w in FirWindow.values)
+                      DropdownMenuItem(
+                          value: w,
+                          child: Text(w == FirWindow.kaiser
+                              ? w.label
+                              : '${w.label}  —  ${w.attenuation.round()} dB'))
+                  ],
+                  onChanged: (v) =>
+                      v == null ? null : c.update(() => c.window = v),
+                ),
+                if (c.window == FirWindow.kaiser)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: _Field(
+                      label: 'Kaiser beta',
+                      value: c.kaiserBeta,
+                      width: 116,
+                      onSubmitted: (v) => c.update(() => c.kaiserBeta = v),
+                    ),
+                  ),
+              ],
+              const SizedBox(height: 8),
               DropdownButtonFormField<fir.Symmetry>(
                 initialValue: c.symmetry,
                 isDense: true,
@@ -946,9 +1196,57 @@ class _FirPanel extends StatelessWidget {
                 ],
                 onChanged: (v) => v == null ? null : c.loadPreset(v),
               ),
+              CheckboxListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                controlAffinity: ListTileControlAffinity.leading,
+                title: const Text('Half band'),
+                subtitle: const Text('alternate taps exactly zero',
+                    style: TextStyle(fontSize: 11)),
+                value: c.halfBand,
+                onChanged: (v) => c.update(() => c.halfBand = v ?? false),
+              ),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                if (c.halfBand)
+                  _Field(
+                    label: 'Passband edge',
+                    value: c.halfBandEdge,
+                    width: 132,
+                    onSubmitted: (v) => c.update(() => c.halfBandEdge = v),
+                  ),
+                _Field(
+                  label: 'Rate factor',
+                  value: '${c.rateFactor}',
+                  width: 104,
+                  onSubmitted: (v) {
+                    final n = int.tryParse(v);
+                    if (n != null && n >= 1) c.update(() => c.rateFactor = n);
+                  },
+                ),
+              ]),
+              if (c.rateFactor > 1)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: SegmentedButton<RateChange>(
+                    showSelectedIcon: false,
+                    segments: const [
+                      ButtonSegment(
+                          value: RateChange.decimate, label: Text('Decimate')),
+                      ButtonSegment(
+                          value: RateChange.interpolate,
+                          label: Text('Interpolate')),
+                    ],
+                    selected: {c.rateChange},
+                    onSelectionChanged: (v) =>
+                        c.update(() => c.rateChange = v.first),
+                  ),
+                ),
             ],
           ),
         ),
+        // A half-band design has one edge and fixed weights, so the band table
+        // would only offer ways to make it not a half-band filter.
+        if (!c.halfBand)
         _Panel(
           title: 'Bands and constraints',
           trailing: IconButton(
@@ -1284,6 +1582,26 @@ class _ArithmeticPanel extends StatelessWidget {
               value: c.wantTestbench,
               onChanged: (v) => c.update(() => c.wantTestbench = v ?? true),
             ),
+            CheckboxListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              title: const Text('Measure the arithmetic noise'),
+              subtitle: const Text('slow: runs the datapath',
+                  style: TextStyle(fontSize: 11)),
+              value: c.measureNoise,
+              onChanged: (v) => c.update(() => c.measureNoise = v ?? false),
+            ),
+            CheckboxListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              title: const Text('Shade the coefficient sensitivity'),
+              subtitle: const Text('what ±½ LSB of error covers',
+                  style: TextStyle(fontSize: 11)),
+              value: c.showSensitivity,
+              onChanged: (v) => c.update(() => c.showSensitivity = v ?? false),
+            ),
           ],
         ],
       ),
@@ -1323,6 +1641,37 @@ class _Plots extends StatelessWidget {
         Trace(ideal.f, ideal.y, scheme.onSurface.withValues(alpha: 0.35),
             width: 1.0),
       Trace(magnitude.f, magnitude.y, scheme.primary),
+    ];
+
+    // The design that was pinned for comparison, under everything else.
+    final pinned = c.pinnedMagnitude();
+    if (pinned != null) {
+      traces.insert(
+          0,
+          Trace(pinned.f, pinned.y, scheme.tertiary.withValues(alpha: 0.85),
+              width: 1.2, dashed: true));
+    }
+
+    // The level the datapath's own arithmetic sits at. Drawn on the magnitude
+    // plot because that is where it changes the reading: a stopband below this
+    // line is not a stopband the hardware will deliver.
+    final noise = c.logScale ? c.noiseFloor() : null;
+    if (noise != null) {
+      final f = Float64List(noise.frequency.length);
+      for (var i = 0; i < f.length; i++) {
+        f[i] = noise.frequency[i] * c.fs;
+      }
+      traces.add(Trace(f, noise.noiseDb, scheme.error.withValues(alpha: 0.7),
+          width: 1.0, dashed: true));
+    }
+
+    // The spread half an LSB of coefficient error covers, under everything
+    // else so the nominal response still reads as the answer.
+    final spread = c.sensitivity();
+    final ribbons = <Ribbon>[
+      if (spread != null && spread.lo.isNotEmpty)
+        Ribbon(spread.f, spread.lo, spread.hi,
+            scheme.secondary.withValues(alpha: 0.28)),
     ];
 
     final corridors = <Corridor>[];
@@ -1375,16 +1724,21 @@ class _Plots extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         LinePlot(
-          title: c.isIir
-              ? '${c.approximation} ${c.response}, order '
-                  '${c.iirEffective!.order}   —   '
-                  '${c.iirEffective!.sos.length} biquad(s)'
-                  '${c.iirEffective!.stable ? '' : '   *** UNSTABLE ***'}'
-              : 'Type ${c.firResult!.ftype} ${c.firResult!.symmetry.name} FIR, '
-                  'N = ${c.firResult!.numtaps}   —   '
-                  '${c.firResult!.iterations} iterations',
+          title: (c.isIir
+                  ? '${c.approximation} ${c.response}, order '
+                      '${c.iirEffective!.order}   —   '
+                      '${c.iirEffective!.sos.length} biquad(s)'
+                      '${c.iirEffective!.stable ? '' : '   *** UNSTABLE ***'}'
+                  : 'Type ${c.firResult!.ftype} '
+                      '${c.firResult!.symmetry.name} FIR, '
+                      'N = ${c.firResult!.numtaps}   —   '
+                      '${c.firResult!.iterations} iterations') +
+              (noise == null ? '' : '   —   arithmetic noise dashed') +
+              (ribbons.isEmpty ? '' : '   —   ±½ LSB shaded') +
+              (pinned == null ? '' : '   —   pinned: ${c.pinnedLabel}'),
           traces: traces,
           corridors: corridors,
+          ribbons: ribbons,
           markers: markers,
           xLabel: 'frequency${c.fs == 1.0 ? ' (normalised)' : ' (Hz)'}',
           yLabel: c.logScale ? 'amplitude (dB)' : 'amplitude',
@@ -1394,11 +1748,189 @@ class _Plots extends StatelessWidget {
         ),
         if (!c.isIir) _DetailPlot(controller: c),
         if (!c.isIir) _ErrorPlot(controller: c),
+        if (c.showPhase || c.showGroupDelay) _TimingPlots(controller: c),
         StemPlot(
           values: c.impulse(),
           title: c.isIir ? 'impulse response' : 'impulse response (the taps)',
         ),
+        if (c.showZPlane) _ZPlanePanel(controller: c),
+        if (c.showSignal) _SignalPlot(controller: c),
       ],
+    );
+  }
+}
+
+/// A signal put through the filter, in both arithmetics at once.
+class _SignalPlot extends StatelessWidget {
+  const _SignalPlot({required this.controller});
+  final DesignController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = controller;
+    final run = c.signalRun();
+    if (run == null) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+
+    final index = Float64List(run.input.length);
+    for (var i = 0; i < index.length; i++) {
+      index[i] = i.toDouble();
+    }
+
+    final notes = <String>[c.testSignal.purpose];
+    final error = run.error;
+    if (error != null) {
+      notes.add('fixed point differs by '
+          '${error.rms.toStringAsExponential(2)} rms, '
+          '${error.peak.toStringAsExponential(2)} peak');
+    }
+    if (run.clipped > 0) {
+      notes.add('*** ${run.clipped} sample(s) clipped: the datapath needs '
+          'more headroom ***');
+    }
+
+    return LinePlot(
+      title: '${c.testSignal.label} through the filter   —   '
+          '${notes.join('   —   ')}',
+      traces: [
+        Trace(index, run.input, scheme.onSurface.withValues(alpha: 0.30),
+            width: 1.0),
+        Trace(index, run.output, scheme.primary),
+        if (run.fixedOutput != null)
+          Trace(index, run.fixedOutput!, scheme.error.withValues(alpha: 0.85),
+              width: 1.0, dashed: true),
+      ],
+      xLabel: run.hasFixed
+          ? 'sample   (input faint, float solid, fixed dashed)'
+          : 'sample   (input faint, output solid)',
+      yLabel: 'amplitude',
+      xRange: (0, (run.input.length - 1).toDouble()),
+      height: 220,
+    );
+  }
+}
+
+/// A y range for the group delay that does not magnify nothing.
+///
+/// A linear-phase FIR's delay is the same at every frequency, so the values
+/// span about 1e-4 of a sample and an axis fitted to them turns floating-point
+/// noise into a mountain range. Half a sample of headroom either side means a
+/// flat delay is drawn as the flat line it is, and a real variation still
+/// fills the plot.
+(double, double)? _delayRange(Float64List delay) {
+  var lo = double.infinity, hi = double.negativeInfinity;
+  for (final v in delay) {
+    if (!v.isFinite) continue;
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  if (!lo.isFinite) return null;
+  final pad = math.max((hi - lo) * 0.08, 0.5);
+  return (lo - pad, hi + pad);
+}
+
+/// Phase and group delay: how much each frequency is held up on its way
+/// through, which is the half of the answer the magnitude plot leaves out.
+class _TimingPlots extends StatelessWidget {
+  const _TimingPlots({required this.controller});
+  final DesignController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = controller;
+    final built = c.phaseAndDelay();
+    if (built == null) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    final ideal = c.phaseAndDelay(ideal: true);
+    final faint = scheme.onSurface.withValues(alpha: 0.35);
+
+    // A linear-phase filter has one number for its delay, so it is worth
+    // naming: the curve below should be that line, and if it is not, the
+    // filter is not the type the panel says it is.
+    final flat = !c.isIir && c.firResult != null
+        ? '   —   linear phase: ${(c.firResult!.numtaps - 1) / 2} samples'
+        : '';
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (c.showGroupDelay)
+          LinePlot(
+            title: 'group delay$flat',
+            traces: [
+              if (ideal != null) Trace(ideal.f, ideal.delay, faint, width: 1.0),
+              Trace(built.f, built.delay, scheme.primary),
+            ],
+            xLabel: 'frequency${c.fs == 1.0 ? ' (normalised)' : ' (Hz)'}',
+            yLabel: 'delay (samples)',
+            xRange: (0, c.fs / 2),
+            yRange: _delayRange(built.delay),
+            height: 170,
+          ),
+        if (c.showPhase)
+          LinePlot(
+            title: 'phase, unwrapped'
+                '${c.isIir ? '' : '   —   the steps of 180° are the zeros'}',
+            traces: [
+              if (ideal != null) Trace(ideal.f, ideal.phase, faint, width: 1.0),
+              Trace(built.f, built.phase, scheme.primary),
+            ],
+            xLabel: 'frequency${c.fs == 1.0 ? ' (normalised)' : ' (Hz)'}',
+            yLabel: 'phase (degrees)',
+            xRange: (0, c.fs / 2),
+            height: 170,
+          ),
+      ],
+    );
+  }
+}
+
+/// Poles and zeros on the unit circle, with the rounded design over the ideal
+/// one when the two differ.
+class _ZPlanePanel extends StatelessWidget {
+  const _ZPlanePanel({required this.controller});
+  final DesignController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = controller;
+    final built = c.zplane();
+    if (built == null) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    final ideal = c.zplane(ideal: true);
+
+    final notes = <String>[];
+    if (c.isIir) {
+      final res = c.iirEffective!;
+      notes.add('max |pole| ${res.maxPoleRadius.toStringAsFixed(4)}'
+          '${res.stable ? '' : '   *** on or outside the circle: UNSTABLE ***'}');
+    } else {
+      notes.add('${built.poles.length} poles at the origin — the delay line');
+    }
+    if (!built.converged) {
+      notes.add('root finding did not settle; the zeros are approximate');
+    }
+
+    return ZPlanePlot(
+      title: 'poles and zeros',
+      note: notes.join('   —   '),
+      sets: [
+        if (ideal != null)
+          ZSet(
+            zeros: ideal.zeros,
+            poles: ideal.poles,
+            colour: scheme.onSurface.withValues(alpha: 0.45),
+            label: 'as designed',
+            muted: true,
+          ),
+        ZSet(
+          zeros: built.zeros,
+          poles: built.poles,
+          colour: scheme.primary,
+          label: ideal == null ? null : 'as built (rounded)',
+        ),
+      ],
+      height: 320,
     );
   }
 }

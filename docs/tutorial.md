@@ -114,7 +114,13 @@ you typed.
 | **Grid density** | How finely the exchange samples each band when it searches for the error peaks, in points per coefficient. 16 is the usual value. Too coarse and the design steps over a ripple peak and reports a smaller δ than it achieved; see the note below. |
 | **Max iters** | The iteration cap. 60 is far more than a converging design needs; if the **Result** panel says *did not converge*, the design ran out. |
 | **Symmetry** | `symmetric` for ordinary filters; `antisymmetric` for a Hilbert transformer or a differentiator, which need a 90° phase shift. |
+| **Method** | Which algorithm designs the filter: the Remez exchange, weighted least squares, or the window method. See [Three ways to design an FIR](#three-ways-to-design-an-fir). |
+| **Window** | Only with the window method: which taper cuts the ideal response, and so how deep the stopband gets. |
+| **Kaiser beta** | Only with the Kaiser window, whose attenuation is set by this number rather than fixed. |
 | **Preset** | Loads a worked example into the band table. A good starting point for a new design. |
+| **Half band** | Design a half-band lowpass: alternate taps come out exactly zero, so half the multiplies disappear. See [Half band and polyphase](#half-band-and-polyphase). |
+| **Passband edge** | Only with **Half band**: the one edge you get to choose. The stopband starts at its mirror about a quarter of the sample rate. |
+| **Rate factor** | Split the filter into this many polyphase components, for a decimator or an interpolator. 1 means no rate change. |
 
 **On grid density.** The reported δ is a *lower bound* on the true deviation,
 never an upper one. Measured on the default lowpass against the response
@@ -205,6 +211,25 @@ The line under the fields reports the Q format, the step size, and a warning if
 any coefficient saturated. A saturated coefficient means the hardware is not the
 filter you designed — give it more bits.
 
+The last two boxes are analyses rather than build options, and both cost real
+time, which is why they are off by default:
+
+**Measure the arithmetic noise.** Rounding the coefficients is only half of what
+fixed point does to a filter; the other half is that every product and every sum
+is rounded too. This drives the exact integer datapath — the one the RTL export
+would generate, structure and folding included — with a few thousand samples,
+compares its output against the same filter computed exactly, and takes the
+spectrum of the difference. That level is drawn on the magnitude plot as a
+dashed line, and the **Result** panel says what it means: a stopband below the
+line is a number on a plot rather than a filter you can build.
+
+**Shade the coefficient sensitivity.** Nudges every coefficient independently by
+up to half an LSB, a hundred and twenty-odd times, and shades the region the
+responses cover. A thin band means the design has margin. A band that swallows
+the stopband means the filter only works at the exact values it was given. For
+an IIR it also counts the draws that came out unstable, which is the failure
+that rounding a high-order elliptic design really produces.
+
 ### File
 
 ![The File panel](images/panel-file.png)
@@ -216,17 +241,66 @@ filter you designed — give it more bits.
 | **Save coefficients…** | The coefficients alone. A `.h` extension gets C arrays; anything else gets CSV with a commented header. In fixed point both carry the stored integers alongside the rounded values. |
 | **Save plot…** | The right-hand pane as a PNG — whichever view is showing, in whichever theme, at twice screen resolution. |
 | **Save C…** | One self-contained C file: a library (`init_filter` / `process_sample` / `free_filter`) and a program that filters raw 64-bit floats from stdin to stdout. |
+| **Save script…** | A NumPy module or a MATLAB function, chosen by the extension you give it — `.py` or `.m`. Both define the coefficients and call the library routine; an FIR goes to `lfilter`/`filter`, a cascade to `sosfilt`. |
+| **Save integer C…** | The same filter with no floating point anywhere: signed integers, products rounded and saturated, sums saturated, in the order the chosen structure sums them. It is the *same* arithmetic as the generated RTL, bit for bit, which makes it the reference model to run on the target before the hardware exists. Needs fixed point. |
 | **Generate SV…**, **Generate VHDL…** | Synthesisable RTL for the structure chosen in **Arithmetic**, with its testbench. Both need fixed-point coefficients; until then they are disabled and the tooltip says why. |
 
 ### Display
 
 ![The Display panel](images/panel-display.png)
 
-**Plot view** is the four response plots. **Design view** draws the filter as the
+**Plot view** is the response plots. **Design view** draws the filter as the
 thing you would build — the adders, delays and multipliers, each labelled with
 its actual constant. **Magnitude in dB** switches the top plot between decibels
 and linear amplitude. **Auto / Light / Dark** follows the desktop or forces a
 theme; the saved plot uses whichever is showing.
+
+Three checkboxes choose which of the optional plots are drawn:
+
+- **Group delay** — how many samples each frequency is held up by. A
+  linear-phase FIR draws a flat line at (N−1)/2, which is the claim being made
+  for it, verified rather than asserted. An IIR does not: its delay peaks around
+  the band edges, and that peak is the price of the coefficients it saved.
+- **Phase** — the same information one integral earlier, unwrapped. Off by
+  default because group delay says it more directly. The steps of 180° in an
+  FIR's phase are its zeros on the unit circle.
+- **Poles and zeros** — the z plane, with the unit circle drawn. Every pole
+  inside it or the filter is unstable, and in fixed point the design's poles and
+  the poles the *rounded* coefficients actually give are drawn together, so a
+  pole that rounding has pushed onto the circle is something you see rather than
+  something you infer from a magnitude plot behaving oddly.
+
+**Pin this design** keeps the current response on the axes, dashed, while you
+edit another against it — the way to answer "is 61 taps really buying me
+anything here?" without alt-tabbing between screenshots. The button turns into
+**Unpin** and names what it is holding.
+
+The two arrows in the title bar are undo and redo, on ⌘Z and ⇧⌘Z. They step
+through complete designs, not individual keystrokes, and reach everything the
+save file reaches.
+
+### Signal
+
+Push a test signal through the filter and plot what came out, alongside what
+went in. The response plots say what happens to a sine wave of every frequency,
+one at a time and forever; that is the complete answer and it is not always the
+legible one.
+
+| signal | what it is for |
+| --- | --- |
+| **impulse** | the taps themselves |
+| **step** | overshoot, ringing, and the pre-echo linear phase pays for its symmetry |
+| **chirp** | the whole band swept, so the transition is a fade you can point at |
+| **tone** | one frequency, for gain and delay |
+| **noise** | everything at once, for the noise floor |
+| **square** | harmonics, and what happens to the ones the filter removes |
+
+In fixed point it runs the signal twice: once through the design in double
+precision and once through the exact integer datapath. Both are drawn, and the
+title reports the difference between them and how many samples the datapath had
+to clip. Clipping is not rounding that averages away — it is the filter ceasing
+to be linear — so one clipped sample is a headroom problem, not a word-length
+one.
 
 ### Result
 
@@ -258,6 +332,79 @@ from what the amplitude response is forced to be at 0 and at Nyquist.
 Practically: leave symmetry on `symmetric` and use an odd number of taps unless
 you have a reason not to. Choose `antisymmetric` when you want a 90° phase
 shift — the Hilbert transformer and differentiator presets set it for you.
+
+### Three ways to design an FIR
+
+The **Method** pulldown offers three, and they are not ranked: each minimises
+something different, and which one is right depends on what your specification
+actually means.
+
+| method | minimises | the stopband it gives | iterates? |
+| --- | --- | --- | --- |
+| Remez exchange | the *worst* weighted error | one flat wall of equal lobes | yes |
+| least squares | the *total* squared error | worst at the transition, quieter further out | no |
+| window | nothing | whatever the window's sidelobes are | no |
+
+**The exchange** is the default because a specification is usually a limit that
+must not be exceeded, and minimax is exactly the promise "nowhere worse than
+this". For a given number of taps no filter has a smaller worst-case error.
+
+**Least squares** gives that up and buys total energy instead. Its error is
+largest at the band edges and falls away from them, so the far stopband ends up
+much deeper than an equiripple design would put it. Reach for it when the thing
+being rejected is broadband, or when the filter feeds something that integrates:
+holding a corner nobody is standing on is taps spent for nothing.
+
+**The window method** does not optimise at all. It takes the exact impulse
+response of the ideal brick wall, which is infinitely long, cuts it to length,
+and tapers the cut so the truncation does not ring. Two things recommend it:
+there is no iteration to fail to converge, and the stopband depth is a property
+of the window rather than of the design.
+
+| window | sidelobes | notes |
+| --- | --- | --- |
+| rectangular | ≈21 dB | no taper at all; the ringing is the point of comparison |
+| Hann | ≈44 dB | sidelobes fall away fastest, so the far stopband is best of the fixed three |
+| Hamming | ≈53 dB | lowest *first* sidelobe, but it rolls off slowly |
+| Blackman | ≈74 dB | the deepest, and the widest main lobe, so it needs the longest filter |
+| Kaiser | set by β | the adjustable one: β trades transition width against depth |
+
+The catch is the other direction. A window only *reaches* its figure once the
+filter is long enough for the window's main lobe to fit inside the transition.
+Ask for a narrow transition with a Blackman window and a short filter and you
+get neither: 161 taps across this document's example transition reaches −75 dB,
+and 81 taps manages only −39 dB.
+
+### Half band and polyphase
+
+Two ways of not doing arithmetic you do not have to do.
+
+**A half-band lowpass** has every other tap at exactly zero. That is not a trick
+played on an ordinary design — it falls out of the problem. Ask for a filter
+that is 1 up to `fp` and 0 from `fs/2 − fp`, with the two bands weighted
+*equally*, and the answer satisfies
+
+    A(w) + A(π − w) = 1
+
+identically: if it did not, averaging it with its own mirror would give an
+equally good filter, and the minimax solution is unique. Written out in taps,
+that identity says the centre tap is ½ and every tap an even number of places
+from it is zero. So ticking **Half band** does not post-process anything. It
+constrains: one band edge instead of a table, equal weights, and a length
+rounded to the nearest 4k+3, because those are the conditions under which the
+answer is a half-band filter at all. The exchange then leaves the vanishing taps
+at about 10⁻¹⁶, and the program sets them to the zero they mathematically are.
+A 43-tap half band needs 23 multiplies instead of 43, and the **Result** panel
+says so.
+
+**A polyphase decomposition** is what makes a rate change cost what it should.
+Decimating by M throws away M−1 of every M outputs, so computing them was
+wasted; splitting the filter into M sub-filters, each fed every Mth sample, and
+summing them computes only the outputs that survive. Interpolating by L is the
+mirror image. Either way the multiplies per sample fall by the rate factor and
+*no arithmetic changes* — the output is the same to the last bit. Set **Rate
+factor** above 1 and the phases appear in the **Result** panel and in the saved
+coefficients, as `e0`, `e1`, … where phase p holds taps p, p+M, p+2M and so on.
 
 ### FIR against IIR
 
@@ -326,14 +473,37 @@ Python prototype in `python_prototype/`, which reads and writes the same format.
   "mode": "FIR — Remez exchange",
   "fs": 48000.0,
   "fir": {
-    "numtaps": 61,
+    "numtaps": 41,
     "symmetry": "symmetric",
     "grid_density": 16,
     "maxiter": 60,
-    "use_spec": true,
+    "use_spec": false,
+    "method": "remez",
+    "window": "hamming",
+    "kaiser_beta": "8.6",
+    "half_band": false,
+    "half_band_edge": "0.2",
+    "rate_factor": 1,
+    "rate_change": "decimate",
     "bands": [
-      [0.0,     9600.0,  1.0, 1.0,  1.0,  0.5, false],
-      [12000.0, 24000.0, 0.0, 0.0, 10.0, 50.0, false]
+      [
+        0.0,
+        0.2,
+        1.0,
+        1.0,
+        1.0,
+        0.5,
+        false
+      ],
+      [
+        0.25,
+        0.5,
+        0.0,
+        0.0,
+        10.0,
+        50.0,
+        false
+      ]
     ]
   },
   "iir": {
@@ -341,8 +511,14 @@ Python prototype in `python_prototype/`, which reads and writes the same format.
     "approximation": "Butterworth",
     "order": 6,
     "auto_order": true,
-    "wp": ["9600", "19200"],
-    "ws": ["14400", "21600"],
+    "wp": [
+      "0.2",
+      "0.4"
+    ],
+    "ws": [
+      "0.3",
+      "0.45"
+    ],
     "rp": "0.5",
     "rs": "40"
   },
@@ -350,17 +526,26 @@ Python prototype in `python_prototype/`, which reads and writes the same format.
     "kind": "fixed",
     "word_bits": 16,
     "auto_frac": true,
-    "frac_bits": 16,
+    "frac_bits": -611,
     "headroom": 2,
     "fixed_coeffs": true,
     "structure": "tree",
     "folded": false,
-    "testbench": true
+    "testbench": true,
+    "measure_noise": false,
+    "sensitivity": false
   },
   "display": {
     "log_scale": true,
     "view": "Plot view",
-    "appearance": "system"
+    "appearance": "system",
+    "phase": false,
+    "signal": false,
+    "signal_kind": "chirp",
+    "signal_frequency": "0.05",
+    "signal_length": 512,
+    "group_delay": true,
+    "zplane": true
   }
 }
 ```
@@ -394,6 +579,12 @@ place of `weight` when `use_spec` is true. `inverse_f` is a boolean.
 `grid_density` and `maxiter` are the search parameters described above.
 `symmetry` is `"symmetric"` or `"antisymmetric"`.
 
+`method` is `"remez"`, `"leastSquares"` or `"window"`; `window` is
+`"rectangular"`, `"hann"`, `"hamming"`, `"blackman"` or `"kaiser"`, and
+`kaiser_beta` is a string. `half_band` is a boolean and `half_band_edge` the one
+edge it needs. `rate_factor` is an integer, 1 for no rate change, and
+`rate_change` is `"decimate"` or `"interpolate"`.
+
 **`iir`**
 
 `response` and `approximation` are stored as the *display* spellings —
@@ -409,12 +600,19 @@ dB. `order` applies when `auto_order` is false.
 `kind` is `"float"` or `"fixed"`. The rest are the Arithmetic panel's fields:
 `word_bits`, `auto_frac`, `frac_bits`, `headroom`, and the hardware options
 `fixed_coeffs`, `structure` (`"chain"`, `"tree"` or `"mac"`), `folded` and
-`testbench`.
+`testbench`. `measure_noise` and `sensitivity` switch on the two analyses.
 
 **`display`**
 
 `log_scale`, `view` (`"Plot view"` or `"Design view"`) and `appearance`
-(`"system"`, `"light"` or `"dark"`).
+(`"system"`, `"light"` or `"dark"`), plus which optional plots are drawn —
+`phase`, `group_delay` and `zplane`, all booleans — and the signal runner's
+`signal`, `signal_kind` (`"impulse"`, `"step"`, `"chirp"`, `"tone"`, `"noise"`
+or `"square"`), `signal_frequency` and `signal_length`.
+
+Of those, only `log_scale` and `view` are keys the Python prototype writes. It
+ignores what it does not know and this program preserves what it does, so the
+two still interchange.
 
 ### Compatibility
 

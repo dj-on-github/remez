@@ -68,6 +68,19 @@ class Span {
   final bool above;
 }
 
+/// A shaded region between two curves over the same x.
+///
+/// For an envelope rather than a corridor: [Corridor] is one rectangle between
+/// two constants, and what a spread of perturbed designs traces out is a band
+/// whose width varies from point to point.
+class Ribbon {
+  const Ribbon(this.x, this.lo, this.hi, this.colour);
+  final Float64List x;
+  final Float64List lo;
+  final Float64List hi;
+  final Color colour;
+}
+
 /// Points drawn as dots, for the extremal frequencies.
 class Markers {
   const Markers(this.x, this.y, this.colour, {this.radius = 2.4});
@@ -85,6 +98,7 @@ class LinePlot extends StatelessWidget {
     required this.xLabel,
     required this.yLabel,
     this.corridors = const [],
+    this.ribbons = const [],
     this.markers = const [],
     this.callouts = const [],
     this.spans = const [],
@@ -97,6 +111,7 @@ class LinePlot extends StatelessWidget {
   final String title;
   final List<Trace> traces;
   final List<Corridor> corridors;
+  final List<Ribbon> ribbons;
   final List<Markers> markers;
   final List<Callout> callouts;
   final List<Span> spans;
@@ -126,6 +141,7 @@ class LinePlot extends StatelessWidget {
               painter: _PlotPainter(
                 traces: traces,
                 corridors: corridors,
+                ribbons: ribbons,
                 markers: markers,
                 callouts: callouts,
                 spans: spans,
@@ -150,6 +166,7 @@ class _PlotPainter extends CustomPainter {
   _PlotPainter({
     required this.traces,
     required this.corridors,
+    required this.ribbons,
     required this.markers,
     required this.callouts,
     required this.spans,
@@ -165,6 +182,7 @@ class _PlotPainter extends CustomPainter {
 
   final List<Trace> traces;
   final List<Corridor> corridors;
+  final List<Ribbon> ribbons;
   final List<Markers> markers;
   final List<Callout> callouts;
   final List<Span> spans;
@@ -192,7 +210,12 @@ class _PlotPainter extends CustomPainter {
     if (plot.width <= 4 || plot.height <= 4) return;
 
     var (x0, x1) = xRange ?? _extent(traces.map((t) => t.x));
-    var (y0, y1) = yRange ?? _extent(traces.map((t) => t.y));
+    var (y0, y1) = yRange ??
+        _extent([
+          ...traces.map((t) => t.y),
+          ...ribbons.map((r) => r.lo),
+          ...ribbons.map((r) => r.hi),
+        ]);
     if (x1 <= x0) x1 = x0 + 1;
     if (y1 <= y0) y1 = y0 + 1;
 
@@ -223,6 +246,23 @@ class _PlotPainter extends CustomPainter {
     for (final c in corridors) {
       final rect = Rect.fromLTRB(sx(c.x0), sy(c.hi), sx(c.x1), sy(c.lo));
       canvas.drawRect(rect, Paint()..color = c.colour);
+    }
+
+    for (final ribbon in ribbons) {
+      if (ribbon.x.length < 2) continue;
+      final path = Path();
+      var started = false;
+      for (var i = 0; i < ribbon.x.length; i++) {
+        if (!ribbon.hi[i].isFinite) continue;
+        final p = Offset(sx(ribbon.x[i]), sy(ribbon.hi[i]));
+        started ? path.lineTo(p.dx, p.dy) : path.moveTo(p.dx, p.dy);
+        started = true;
+      }
+      for (var i = ribbon.x.length - 1; i >= 0; i--) {
+        if (!ribbon.lo[i].isFinite) continue;
+        path.lineTo(sx(ribbon.x[i]), sy(ribbon.lo[i]));
+      }
+      if (started) canvas.drawPath(path..close(), Paint()..color = ribbon.colour);
     }
 
     for (final trace in traces) {

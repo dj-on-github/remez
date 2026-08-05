@@ -753,30 +753,9 @@ Float64List sosImpulse(List<Float64List> sos, int n) {
   return sosFilter(sos, x);
 }
 
-/// Group delay in samples, by differencing the unwrapped phase.
-Float64List groupDelay(List<Float64List> sos, Float64List w) {
-  const eps = 1e-6;
-  final out = Float64List(w.length);
-  final lo = Float64List(w.length);
-  final hi = Float64List(w.length);
-  for (var i = 0; i < w.length; i++) {
-    lo[i] = w[i] - eps;
-    hi[i] = w[i] + eps;
-  }
-  final a = sosFreqz(sos, lo);
-  final b = sosFreqz(sos, hi);
-  for (var i = 0; i < w.length; i++) {
-    var d = b[i].arg - a[i].arg;
-    while (d > math.pi) {
-      d -= 2 * math.pi;
-    }
-    while (d < -math.pi) {
-      d += 2 * math.pi;
-    }
-    out[i] = -d / (2 * eps);
-  }
-  return out;
-}
+// Group delay lives in `response.dart`, computed from the derivative of the
+// transfer function rather than by differencing a phase, and covering an FIR
+// as well as a cascade.
 
 /// Zeros, poles and gain of a cascade.
 ///
