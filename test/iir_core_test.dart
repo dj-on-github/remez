@@ -25,6 +25,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:remez/src/fixed_point.dart';
 import 'package:remez/src/iir_core.dart';
 
 /// Designs whose sections come out in a different order from the Python's,
@@ -159,5 +160,58 @@ void main() {
         reason: 'the set of designs whose section ORDER differs from the '
             'Python has changed; the filters are still checked as filters '
             'above, but work out why this moved before updating the list');
+  });
+
+  group('the gain across the cascade', () {
+    /// A tenth-order bandpass a sixteenth of the sample rate wide. Its overall
+    /// gain is around 1e-10, which is what makes it the case worth pinning: one
+    /// section holding all of it has a numerator six orders of magnitude below
+    /// the least significant bit of Q1.14, so it rounds to zero and the cascade
+    /// stops passing anything at all.
+    IIRResult narrow() => design('bandpass', 'butterworth',
+        wp: [2000, 3000], ws: [1000, 4000], rp: 0.5, rs: 70, fs: 32000);
+
+    test('is shared out rather than left in one section', () {
+      final res = narrow();
+      expect(res.k, lessThan(1e-9));
+      expect(res.sos.length, greaterThan(1));
+      for (var s = 0; s < res.sos.length; s++) {
+        // Every zero of this design is at +-1, so each numerator is a scaled
+        // (1 -+ z^-1)^2 and b0 is the section's whole share of the gain.
+        expect(res.sos[s][0].abs(), greaterThan(0.01),
+            reason: 'section $s should carry a representable share');
+      }
+    });
+
+    test('still multiplies back to the gain it started with', () {
+      final res = narrow();
+      var product = 1.0;
+      for (final s in res.sos) {
+        product *= s[0];
+      }
+      expect(product, closeTo(res.k, res.k.abs() * 1e-12));
+    });
+
+    test('leaves a filter that quantizes to something measurable', () {
+      final res = narrow();
+      final q = quantizeSos(res.sos, 16);
+      final eff = withSos(res, sosRows(q));
+      expect(eff.deadSection, isNull);
+      expect(eff.achievedRp.isFinite, isTrue);
+      expect(eff.achievedRs, greaterThan(res.rs));
+    });
+
+    test('a numerator rounded away is named rather than measured', () {
+      final res = narrow();
+      final sos = [for (final s in res.sos) Float64List.fromList(s.toList())];
+      sos[1][0] = sos[1][1] = sos[1][2] = 0.0;
+      final eff = withSos(res, sos);
+      expect(eff.deadSection, 1);
+      expect(eff.degenerate, isTrue);
+      // The measurements are infinite, and an infinite attenuation must not be
+      // allowed to read as meeting the stopband spec.
+      expect(eff.achievedRs, double.infinity);
+      expect(eff.meetsSpec, isFalse);
+    });
   });
 }

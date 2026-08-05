@@ -119,8 +119,29 @@ class IIRResult {
   final List<List<double>> passbandRanges;
   final List<List<double>> stopbandRanges;
 
+  /// The index of the first section with nothing left of it, or null.
+  ///
+  /// A numerator whose three coefficients have all rounded to zero kills the
+  /// whole cascade: the response is identically zero, and every figure measured
+  /// from it comes back infinite. Reported rather than measured, because the
+  /// measurement is exactly what stops meaning anything.
+  int? get deadSection {
+    for (var s = 0; s < sos.length; s++) {
+      for (final v in sos[s]) {
+        if (!v.isFinite) return s;
+      }
+      if (sos[s][0] == 0.0 && sos[s][1] == 0.0 && sos[s][2] == 0.0) return s;
+    }
+    return null;
+  }
+
+  /// True when the cascade has no response left to measure.
+  bool get degenerate => deadSection != null;
+
   bool get meetsSpec =>
-      achievedRp <= rp * 1.0001 + 1e-9 && achievedRs >= rs - 1e-4;
+      !degenerate &&
+      achievedRp <= rp * 1.0001 + 1e-9 &&
+      achievedRs >= rs - 1e-4;
 
   /// Complex frequency response at physical frequencies [f].
   List<Complex> responseAt(List<double> f) {
@@ -657,6 +678,17 @@ int _argMin(List<double> values) {
 /// the sharpest, closest-to-the-circle pole pair last -- is the usual one for a
 /// cascade, since it delays the biggest internal peak until the earlier
 /// sections have already attenuated whatever it would ring on.
+///
+/// The overall gain is spread evenly over the sections rather than pushed into
+/// the first one. Both give the same filter in exact arithmetic, but the gain
+/// of a sharp narrow-band design is small enough to matter: an order-10
+/// bandpass a sixteenth of the sample rate wide has k around 1e-10, and a
+/// single section carrying all of it has a numerator six orders of magnitude
+/// below the least significant bit of any sensible fixed-point format. It
+/// quantizes to zero and takes the whole cascade with it. An even share is the
+/// n-th root of that, which is representable, and it also keeps the signal off
+/// the noise floor through the earlier sections instead of attenuating it to
+/// nothing at the input and amplifying the quantization noise back up.
 List<Float64List> zpkToSos(List<Complex> zIn, List<Complex> pIn, double k) {
   final z = List<Complex>.from(zIn);
   final p = List<Complex>.from(pIn);
@@ -692,11 +724,32 @@ List<Float64List> zpkToSos(List<Complex> zIn, List<Complex> pIn, double k) {
     sections.add(Float64List.fromList([b[0], b[1], b[2], a[0], a[1], a[2]]));
   }
 
-  // All the gain goes into the first section.
-  for (var i = 0; i < 3; i++) {
-    sections.first[i] *= k;
-  }
+  _spreadGain(sections, k);
   return sections;
+}
+
+/// Multiply the section numerators by [k], an even share to each.
+///
+/// The last section takes whatever is left rather than another copy of the
+/// root, so that the sections multiply back to exactly [k] however the root
+/// rounded. A zero gain, and a single section, both fall out of this as the
+/// old whole-gain-in-one-section case.
+void _spreadGain(List<Float64List> sections, double k) {
+  final n = sections.length;
+  var share = 1.0;
+  if (n > 1 && k != 0.0) {
+    share = math.pow(k.abs(), 1.0 / n).toDouble();
+  }
+  var rest = k;
+  for (var s = 0; s < n - 1; s++) {
+    for (var i = 0; i < 3; i++) {
+      sections[s][i] *= share;
+    }
+    rest /= share;
+  }
+  for (var i = 0; i < 3; i++) {
+    sections[n - 1][i] *= rest;
+  }
 }
 
 List<double> _fromRoots(Complex r1, Complex r2) {

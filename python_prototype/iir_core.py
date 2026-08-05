@@ -429,6 +429,17 @@ def zpk_to_sos(z, p, k):
     for cascade implementation, since it delays the biggest internal peak until
     after the earlier sections have already attenuated whatever it would ring
     on.
+
+    The overall gain is spread evenly over the sections rather than pushed into
+    the first one.  Both give the same filter in exact arithmetic, but the gain
+    of a sharp narrow-band design is small enough to matter: an order-10
+    bandpass a sixteenth of the sample rate wide has k around 1e-10, and a
+    single section carrying all of it has a numerator six orders of magnitude
+    below the least significant bit of any sensible fixed-point format.  It
+    quantizes to zero and takes the whole cascade with it.  An even share is the
+    n-th root of that, which is representable, and it also keeps the signal off
+    the noise floor through the earlier sections instead of attenuating it to
+    nothing at the input and amplifying the quantization noise back up.
     """
     z = list(np.atleast_1d(np.asarray(z, dtype=complex)))
     p = list(np.atleast_1d(np.asarray(p, dtype=complex)))
@@ -454,8 +465,25 @@ def zpk_to_sos(z, p, k):
         sos.append(np.concatenate([b, a]))
 
     out = np.array(sos)
-    out[0, :3] *= k
+    _spread_gain(out, k)
     return out
+
+
+def _spread_gain(sos, k):
+    """Multiply the section numerators by ``k``, an even share to each.
+
+    The last section takes whatever is left rather than another copy of the
+    root, so that the sections multiply back to exactly ``k`` however the root
+    rounded.  A zero gain, and a single section, both fall out of this as the
+    old whole-gain-in-one-section case.
+    """
+    n = len(sos)
+    share = abs(k) ** (1.0 / n) if n > 1 and k != 0.0 else 1.0
+    rest = k
+    for s in range(n - 1):
+        sos[s, :3] *= share
+        rest /= share
+    sos[n - 1, :3] *= rest
 
 
 def sos_freqz(sos, w):
@@ -593,8 +621,30 @@ class IIRResult:
         return sos_freqz(self.sos, 2.0 * np.pi * np.asarray(f, dtype=float) / self.fs)
 
     @property
+    def dead_section(self):
+        """The index of the first section with nothing left of it, or None.
+
+        A numerator whose three coefficients have all rounded to zero kills the
+        whole cascade: the response is identically zero, and every figure
+        measured from it comes back infinite.  Reported rather than measured,
+        because the measurement is exactly what stops meaning anything.
+        """
+        for s, row in enumerate(np.atleast_2d(self.sos)):
+            if not np.all(np.isfinite(row)):
+                return s
+            if not np.any(row[:3]):
+                return s
+        return None
+
+    @property
+    def degenerate(self) -> bool:
+        """True when the cascade has no response left to measure."""
+        return self.dead_section is not None
+
+    @property
     def meets_spec(self) -> bool:
-        return (self.achieved_rp <= self.rp * 1.0001 + 1e-9
+        return (not self.degenerate
+                and self.achieved_rp <= self.rp * 1.0001 + 1e-9
                 and self.achieved_rs >= self.rs - 1e-4)
 
 

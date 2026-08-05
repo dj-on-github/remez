@@ -1480,12 +1480,29 @@ class DesignController extends ChangeNotifier {
           '${res.stable ? 'stable' : '*** UNSTABLE ***'}');
       b.writeln();
       b.writeln('spec check');
-      b.writeln('  passband ripple  achieved '
-          '${res.achievedRp.toStringAsFixed(4)} dB  required '
-          '${res.rp} dB   ${res.achievedRp <= res.rp * 1.0001 + 1e-9 ? 'met' : 'MISSED'}');
-      b.writeln('  stopband atten.  achieved '
-          '${res.achievedRs.toStringAsFixed(4)} dB  required '
-          '${res.rs} dB   ${res.achievedRs >= res.rs - 1e-4 ? 'met' : 'MISSED'}');
+      final dead = res.deadSection;
+      if (dead != null) {
+        // Both figures are measured from a response that is identically zero,
+        // so they come back infinite -- and an infinite attenuation would
+        // otherwise be reported as meeting the stopband spec.
+        b.writeln('  *** section $dead has no numerator left ***');
+        b.writeln('  its three b coefficients all rounded to zero'
+            '${fixed != null ? ' in ${fixed!.qFormat}' : ''}, so the');
+        b.writeln('  cascade passes nothing and neither figure below means');
+        b.writeln('  anything.  Widen the word, or place the binary point by');
+        b.writeln('  hand further to the right.');
+        b.writeln('  passband ripple  not measurable   required '
+            '${res.rp} dB   MISSED');
+        b.writeln('  stopband atten.  not measurable   required '
+            '${res.rs} dB   MISSED');
+      } else {
+        b.writeln('  passband ripple  achieved '
+            '${res.achievedRp.toStringAsFixed(4)} dB  required '
+            '${res.rp} dB   ${res.achievedRp <= res.rp * 1.0001 + 1e-9 ? 'met' : 'MISSED'}');
+        b.writeln('  stopband atten.  achieved '
+            '${res.achievedRs.toStringAsFixed(4)} dB  required '
+            '${res.rs} dB   ${res.achievedRs >= res.rs - 1e-4 ? 'met' : 'MISSED'}');
+      }
       if (verification == Verified.unverified) {
         b.writeln();
         b.writeln('NOTE: this combination is not yet checked against the');

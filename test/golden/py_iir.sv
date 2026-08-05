@@ -10,9 +10,9 @@
 // a0 is 1 for every section, so nothing multiplies by it; a1
 // and a2 are given as designed and negated in the multiplier.
 //
-// Coefficients  16 bits, Q2.13   (value = integer * 2^-13)
-// Datapath      18 bits = 16 + 2 headroom, Q4.13
-//               unity is 8192, range [-16, 15.9999]
+// Coefficients  16 bits, Q1.14   (value = integer * 2^-14)
+// Datapath      18 bits = 16 + 2 headroom, Q3.14
+//               unity is 16384, range [-8, 7.99994]
 // Products are exact, then rounded to nearest and saturated; adds
 // saturate.  Headroom is what keeps the adders off their limits.
 //
@@ -160,7 +160,7 @@ module biq #(
     parameter int NSEC     = 3,
     parameter int NCOEF    = 15,
     parameter int WCOEF    = 16,
-    parameter int FRAC     = 13,
+    parameter int FRAC     = 14,
     parameter int HEADROOM = 2,
     parameter int LATENCY  = 1,
     parameter int WDATA    = WCOEF + HEADROOM
@@ -175,9 +175,9 @@ module biq #(
 );
     // Five stored integers per section, in the order b0 b1 b2 a1 a2.
     localparam longint COEF [0:NCOEF-1] = '{
-        27, 54, 27, -9991, 3605,
-        8192, 16384, 8192, -6965, 5074,
-        8192, 16384, 8192, -4560, 7074
+        2431, 4863, 2431, -19982, 7209,
+        2431, 4863, 2431, -13930, 10148,
+        2431, 4863, 2431, -9119, 14147
     };
 
     // chain[0] is the input; chain[s+1] is the output of section s.

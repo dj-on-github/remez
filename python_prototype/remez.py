@@ -1791,20 +1791,38 @@ class RemezApp:
         out.append("")
 
         out.append("spec check")
-        rp_verdict = "met" if res.achieved_rp <= res.rp * 1.0001 + 1e-9 else "MISSED"
-        rs_verdict = "met" if res.achieved_rs >= res.rs - 1e-4 else "MISSED"
-        out.append(f"  passband ripple  achieved {res.achieved_rp:8.4g} dB  "
-                   f"required {res.rp:8.4g} dB   {rp_verdict}")
-        out.append(f"  stopband atten.  achieved {res.achieved_rs:8.4g} dB  "
-                   f"required {res.rs:8.4g} dB   {rs_verdict}")
-        if not res.meets_spec and not res.auto_order:
-            out.append(f"  raise the order to {res.order_estimate} to meet both")
-        elif not res.meets_spec:
-            # Only reachable for a band response whose edges are not
-            # geometrically symmetric about the band centre.
-            out.append("  the band edges are not geometrically symmetric, so one")
-            out.append("  transition is wider than asked for; nudge an edge or")
-            out.append("  raise the order by one.")
+        dead = res.dead_section
+        if dead is not None:
+            # Both figures are measured from a response that is identically
+            # zero, so they come back infinite -- and an infinite attenuation
+            # would otherwise be reported as meeting the stopband spec.
+            where = f" in {self.fixed.qformat}" if self.fixed is not None else ""
+            out.append(f"  *** section {dead} has no numerator left ***")
+            out.append(f"  its three b coefficients all rounded to zero{where}, so the")
+            out.append("  cascade passes nothing and neither figure below means")
+            out.append("  anything.  Widen the word, or place the binary point by")
+            out.append("  hand further to the right.")
+            out.append(f"  passband ripple  not measurable   "
+                       f"required {res.rp:8.4g} dB   MISSED")
+            out.append(f"  stopband atten.  not measurable   "
+                       f"required {res.rs:8.4g} dB   MISSED")
+        else:
+            rp_verdict = "met" if res.achieved_rp <= res.rp * 1.0001 + 1e-9 else "MISSED"
+            rs_verdict = "met" if res.achieved_rs >= res.rs - 1e-4 else "MISSED"
+            out.append(f"  passband ripple  achieved {res.achieved_rp:8.4g} dB  "
+                       f"required {res.rp:8.4g} dB   {rp_verdict}")
+            out.append(f"  stopband atten.  achieved {res.achieved_rs:8.4g} dB  "
+                       f"required {res.rs:8.4g} dB   {rs_verdict}")
+            # Advice on the order only makes sense against a real measurement,
+            # which is why it sits inside this branch.
+            if not res.meets_spec and not res.auto_order:
+                out.append(f"  raise the order to {res.order_estimate} to meet both")
+            elif not res.meets_spec:
+                # Only reachable for a band response whose edges are not
+                # geometrically symmetric about the band centre.
+                out.append("  the band edges are not geometrically symmetric, so one")
+                out.append("  transition is wider than asked for; nudge an edge or")
+                out.append("  raise the order by one.")
         out.append("")
 
         edges = ", ".join(f"{v:g}" for v in res.wn)

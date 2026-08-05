@@ -10,9 +10,9 @@
 -- a0 is 1 for every section, so nothing multiplies by it; a1
 -- and a2 are given as designed and negated in the multiplier.
 --
--- Coefficients  16 bits, Q2.13   (value = integer * 2^-13)
--- Datapath      18 bits = 16 + 2 headroom, Q4.13
---               unity is 8192, range [-16, 15.9999]
+-- Coefficients  16 bits, Q1.14   (value = integer * 2^-14)
+-- Datapath      18 bits = 16 + 2 headroom, Q3.14
+--               unity is 16384, range [-8, 7.99994]
 -- Products are exact, then rounded to nearest and saturated; adds
 -- saturate.  Headroom is what keeps the adders off their limits.
 --
@@ -249,7 +249,7 @@ entity biq is
         NSEC     : positive := 3;
         NCOEF    : positive := 15;
         WCOEF    : positive := 16;
-        FRAC     : natural  := 13;
+        FRAC     : natural  := 14;
         HEADROOM : natural  := 2;
         LATENCY  : positive := 1;
         WDATA    : positive := 18);
@@ -271,9 +271,9 @@ architecture rtl of biq is
 
     -- Five stored integers per section, in the order b0 b1 b2 a1 a2.
     constant COEF : coef_array_t(0 to NCOEF-1) := (
-        27, 54, 27, -9991, 3605,
-        8192, 16384, 8192, -6965, 5074,
-        8192, 16384, 8192, -4560, 7074
+        2431, 4863, 2431, -19982, 7209,
+        2431, 4863, 2431, -13930, 10148,
+        2431, 4863, 2431, -9119, 14147
     );
 
     signal chain : data_array_t(0 to NSEC);

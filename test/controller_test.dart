@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:remez/src/controller.dart';
 import 'package:remez/src/fir_core.dart' as fir;
+import 'package:remez/src/iir_core.dart' as iir;
 
 void main() {
   test('it designs a lowpass on construction', () {
@@ -127,6 +128,56 @@ void main() {
     expect(m.f.last, closeTo(c.fs / 2, 1e-12));
     expect(c.impulse().length, c.firResult!.numtaps);
   });
+  group('a narrow IIR bandpass at sixteen bits', () {
+    /// The design from `inf_problem.remz`: order 10, a sixteenth of the sample
+    /// rate wide, so the overall gain is around 1e-10.
+    DesignController narrow() {
+      final c = DesignController();
+      c.update(() {
+        c.mode = Mode.iir;
+        c.response = 'bandpass';
+        c.approximation = 'butterworth';
+        c.fs = 32000;
+        c.wp = ['2000', '3000'];
+        c.ws = ['1000', '4000'];
+        c.rp = '0.5';
+        c.rs = '70';
+        c.arithmetic = Arithmetic.fixed;
+        c.wordBits = 16;
+      });
+      return c;
+    }
+
+    test('quantizes to a filter with a response left', () {
+      final c = narrow();
+      expect(c.error, isNull);
+      expect(c.iirEffective!.deadSection, isNull);
+      expect(c.iirEffective!.achievedRp.isFinite, isTrue);
+      expect(c.iirEffective!.achievedRs, greaterThan(70.0));
+      expect(c.report(), isNot(contains('Infinity')));
+    });
+
+    test('and the plot has a curve to draw', () {
+      final c = narrow();
+      final m = c.magnitude();
+      expect(m.y.where((v) => v.isFinite), isNotEmpty);
+    });
+
+    test('a numerator rounded away is reported as a failure, not as met', () {
+      final c = narrow();
+      final sos = [
+        for (final s in c.iirEffective!.sos) Float64List.fromList(s.toList())
+      ];
+      sos[0][0] = sos[0][1] = sos[0][2] = 0.0;
+      c.iirEffective = iir.withSos(c.iirResult!, sos);
+      final report = c.report();
+      expect(report, contains('section 0 has no numerator left'));
+      expect(report, contains('stopband atten.  not measurable'));
+      expect(report, isNot(contains('dB   met')));
+      expect(report, isNot(contains('Infinity')));
+    });
+  });
+
   group('weights from the Spec column', () {
     // A 0.5 dB peak-to-peak passband is +-delta about a gain of 1 where
     // 20*log10((1+d)/(1-d)) = 0.5, and a 50 dB stopband is a deviation of
