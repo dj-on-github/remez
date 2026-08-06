@@ -180,6 +180,44 @@
       color: var(--ink);
     }
 
+    /* Downloads */
+    .downloads {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }
+    .dl {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px 22px;
+      text-align: center;
+    }
+    .dl .os { font-size: 1.7rem; display: block; margin-bottom: 8px; }
+    .dl h3 { margin: 0 0 4px; font-size: 1.15rem; }
+    .dl .arch { color: var(--ink-faint); font-size: 0.85rem; margin: 0 0 14px; }
+    .dl .links { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+    .dl a.pill {
+      display: inline-block;
+      min-width: 150px;
+      background: var(--trace);
+      color: #08130a;
+      text-decoration: none;
+      padding: 8px 18px;
+      border-radius: 999px;
+      font-size: 0.92rem;
+      font-weight: 700;
+      transition: background 0.15s ease, transform 0.15s ease;
+    }
+    .dl a.pill:hover { background: var(--trace-dark); transform: translateY(-1px); }
+    .dl a.pill.alt {
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--border);
+      font-weight: 600;
+    }
+    .dl a.pill.alt:hover { background: var(--panel-2); }
+
     .note {
       margin-top: 22px;
       color: var(--ink-soft);
@@ -213,7 +251,10 @@
       <img src="https://github.com/dj-on-github/remez/raw/main/web/icons/Icon-192.png" alt="remez icon" />
       <span class="name"><span class="caret">&gt;</span> remez</span>
     </div>
-    <a class="button" href="app/">Launch the Web App</a>
+    <div class="cta-row" style="margin:0">
+      <a class="button ghost" href="#download">Download</a>
+      <a class="button" href="app/">Launch the Web App</a>
+    </div>
   </header>
 
   <main>
@@ -226,6 +267,7 @@
       </p>
       <div class="cta-row">
         <a class="button" href="app/">Launch the Web App</a>
+        <a class="button ghost" href="#download">Download for Desktop</a>
         <a class="button ghost" href="https://github.com/dj-on-github/remez/blob/main/docs/tutorial.md">Read the Tutorial</a>
       </div>
       <div class="hero-frame">
@@ -319,6 +361,56 @@
           and <code class="mono">--version</code> without opening a window.
         </p>
       </div>
+    </section>
+
+    <section id="download">
+      <h2>Download for Desktop<span class="rule"></span></h2>
+      <p class="lead" style="text-align:center">
+        Prefer a native app? Grab the latest build for your platform. These links
+        always point at the most recent release.
+      </p>
+      <div class="downloads">
+        <div class="dl">
+          <span class="os">&#128421;&#65039;</span>
+          <h3>Windows</h3>
+          <p class="arch">x64 &middot; portable zip</p>
+          <div class="links">
+            <a class="pill" href="https://github.com/dj-on-github/remez/releases/latest/download/remez-windows-x64.zip">Download .zip</a>
+          </div>
+        </div>
+        <div class="dl">
+          <span class="os">&#127822;</span>
+          <h3>macOS</h3>
+          <p class="arch">Disk image</p>
+          <div class="links">
+            <a class="pill" href="https://github.com/dj-on-github/remez/releases/latest/download/remez-macos.dmg">Download .dmg</a>
+          </div>
+        </div>
+        <div class="dl">
+          <span class="os">&#128039;</span>
+          <h3>Linux (x64)</h3>
+          <p class="arch">AppImage, .deb or tarball</p>
+          <div class="links">
+            <a class="pill" href="https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-x64.AppImage">AppImage</a>
+            <a class="pill alt" href="https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-x64.deb">.deb</a>
+            <a class="pill alt" href="https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-x64.tar.gz">.tar.gz</a>
+          </div>
+        </div>
+        <div class="dl">
+          <span class="os">&#128039;</span>
+          <h3>Linux (arm64)</h3>
+          <p class="arch">AppImage, .deb or tarball</p>
+          <div class="links">
+            <a class="pill" href="https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-arm64.AppImage">AppImage</a>
+            <a class="pill alt" href="https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-arm64.deb">.deb</a>
+            <a class="pill alt" href="https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-arm64.tar.gz">.tar.gz</a>
+          </div>
+        </div>
+      </div>
+      <p class="note">
+        All releases are listed on the
+        <a href="https://github.com/dj-on-github/remez/releases">GitHub Releases page</a>.
+      </p>
     </section>
   </main>
 

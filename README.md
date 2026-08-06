@@ -1,10 +1,28 @@
 > [!NOTE]
 > Official web site at: [https://github.com/dj-on-github/remez](https://github.com/dj-on-github/remez).
+>
+> Run it now in your browser: [https://dj-on-github.github.io/remez/](https://dj-on-github.github.io/remez/)
 
 # remez — a digital filter designer
 
 Parks–McClellan FIR design and classical IIR design, with the plots, the
 fixed-point arithmetic and the exports.
+
+## Downloads
+
+Pre-built desktop applications are published on the
+[Releases page](https://github.com/dj-on-github/remez/releases). The links
+below always point at the latest release:
+
+| Platform | Download |
+| --- | --- |
+| Windows (x64) | [remez-windows-x64.zip](https://github.com/dj-on-github/remez/releases/latest/download/remez-windows-x64.zip) |
+| macOS | [remez-macos.dmg](https://github.com/dj-on-github/remez/releases/latest/download/remez-macos.dmg) |
+| Linux (x64) | [.AppImage](https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-x64.AppImage) · [.deb](https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-x64.deb) · [.tar.gz](https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-x64.tar.gz) |
+| Linux (arm64) | [.AppImage](https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-arm64.AppImage) · [.deb](https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-arm64.deb) · [.tar.gz](https://github.com/dj-on-github/remez/releases/latest/download/remez-linux-arm64.tar.gz) |
+
+Or [run it in your browser](https://dj-on-github.github.io/remez/) — no install
+required.
 
 Originally a port of the Python tool of the same name, which is now in the
 `python_prototype` subdirectory; this is the version that ships. Everything here was
