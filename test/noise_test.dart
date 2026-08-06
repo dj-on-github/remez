@@ -63,6 +63,32 @@ void main() {
       expect(measured.noiseDb.length, measured.frequency.length);
     });
 
+    test('a sharp IIR cascade is rounding-limited, not clipping-limited', () {
+      // An order-11 elliptic across a 300 Hz transition at 32 kHz: max |pole|
+      // is 0.9947, so the sections in the middle of the cascade have a large
+      // peak gain of their own. If the overall gain is spread over the
+      // sections without regard to where those peaks are, the node behind one
+      // of them saturates -- and clipping is the same size whatever the word
+      // length, so this figure would sit still instead of following it down.
+      DesignController sharp(int bits) => fixedAt(bits, also: (c) {
+            c.mode = Mode.iir;
+            c.response = 'lowpass';
+            c.approximation = 'elliptic';
+            c.fs = 32000;
+            c.wp = ['6400'];
+            c.ws = ['6700'];
+            c.rp = '0.5';
+            c.rs = '70';
+          });
+
+      final at16 = sharp(16).noiseFloor()!;
+      final at24 = sharp(24).noiseFloor()!;
+      expect(at24.medianDb, lessThan(at16.medianDb - 6.02 * 8 + 6.0),
+          reason: 'eight more bits should be about 48 dB quieter');
+      expect(at24.worstDb, lessThan(0.0),
+          reason: 'noise above full scale means the cascade is clipping');
+    });
+
     test('an IIR can be measured too', () {
       final c = fixedAt(16, also: (c) {
         c.mode = Mode.iir;

@@ -96,7 +96,7 @@ done so nobody "fixes" them.
 | --- | --- |
 | `fir_core.dart` | **complete.** All four linear-phase types, multiband, weights, inverse-f weighting, reference scaling for long filters. Matches the Python to 1e-9 per tap on every reference design |
 | `fixed_point.dart` | **complete.** Taps and biquad sections, with the binary point placed automatically |
-| `datapath.dart` | **complete.** chain / tree / MAC, folding, saturating arithmetic, the measured noise floor |
+| `datapath.dart` | **complete.** chain / tree / MAC, folding, saturating arithmetic, the measured noise floor. The one deliberate divergence: Python's integers grow to fit and Dart's are 64 bits, so a datapath past 63 bits is refused here rather than modelled |
 | `iir_core.dart` | **complete.** All four approximations across all four responses |
 | `controller.dart`, `plots.dart`, `main.dart` | the app: FIR and IIR design, magnitude, weighted error and impulse plots, the arithmetic panel, the report, all eight presets, the grid density and iteration cap, and the dB Spec column that derives the band weights |
 | `design_view.dart` | **complete.** The filter as built: the biquad cascade in transposed direct form II, the FIR as a tapped delay line with the middle elided past thirteen taps |

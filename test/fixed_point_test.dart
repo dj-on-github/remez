@@ -156,7 +156,7 @@ void main() {
       final c = entry as Map<String, dynamic>;
       final label = c['kind'] == 'fir'
           ? 'fir ${c['structure']} ${c['folded'] == true ? 'folded' : 'flat'}'
-          : 'iir cascade';
+          : 'iir cascade at ${c['bits']} bits';
       test('$label matches', () {
         final stim = (c['stim'] as List<dynamic>).cast<int>();
         final want = (c['expect'] as List<dynamic>).cast<int>();
@@ -198,6 +198,63 @@ void main() {
       expect(add(100, 100, 8), 127);
       expect(add(-100, -100, 8), -128);
       expect(mul(127, 127, 0, 8), 127);
+    });
+
+    test('the product is exact at every width the quantizer allows', () {
+      // A w-bit coefficient times a (w + headroom)-bit sample needs
+      // 2w + headroom bits before the shift takes them away, which is past a
+      // Dart int well before the widest word this tool accepts. The Python
+      // does it in arbitrary precision, so anything less than exact here is a
+      // divergence as well as a wrong answer.
+      BigInt want(int coef, int sample, int frac, int width) {
+        var p = BigInt.from(coef) * BigInt.from(sample);
+        if (frac > 0) p = (p + (BigInt.one << (frac - 1))) >> frac;
+        final lo = BigInt.from(-(1 << (width - 1)));
+        final hi = BigInt.from((1 << (width - 1)) - 1);
+        return p < lo ? lo : (p > hi ? hi : p);
+      }
+
+      final rng = math.Random(99);
+      for (final bits in [8, 16, 24, 32, 40, 53]) {
+        for (final headroom in [0, 2, 6, 10]) {
+          final width = bits + headroom;
+          if (width > maxDatapathBits) continue;
+          for (final frac in [0, 1, bits ~/ 2, bits - 1]) {
+            final cMax = (1 << (bits - 1)) - 1;
+            final sMax = (1 << (width - 1)) - 1;
+            // The corners first: full scale both ways is where it wrapped.
+            final cases = <List<int>>[
+              [cMax, sMax],
+              [-cMax - 1, sMax],
+              [cMax, -sMax - 1],
+              [-cMax - 1, -sMax - 1],
+              for (var i = 0; i < 20; i++)
+                [
+                  (rng.nextDouble() * 2 * cMax - cMax).round(),
+                  (rng.nextDouble() * 2 * sMax - sMax).round(),
+                ],
+            ];
+            for (final v in cases) {
+              expect(BigInt.from(mul(v[0], v[1], frac, width)),
+                  want(v[0], v[1], frac, width),
+                  reason: 'coef=${v[0]} sample=${v[1]} frac=$frac '
+                      'width=$width');
+            }
+          }
+        }
+      }
+    });
+
+    test('a datapath wider than a machine word is refused, not wrapped', () {
+      expect(maxDatapathBits, lessThan(64));
+      // 53 bits is the widest word the quantizer allows; twelve bits of
+      // headroom takes the datapath past what a Dart int can hold.
+      expect(() => simulateIir([[1, 0, 0, 0, 0]], [1], 10, 53, 12),
+          throwsA(isA<DatapathError>()));
+      expect(() => simulateFir([1], [1], 10, 53, 12),
+          throwsA(isA<DatapathError>()));
+      // And the width just inside the limit still runs.
+      expect(simulateIir([[1, 0, 0, 0, 0]], [1], 10, 53, 10), hasLength(1));
     });
 
     test('the chain and the tree agree until something clips', () {

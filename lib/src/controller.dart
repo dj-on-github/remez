@@ -1645,10 +1645,7 @@ class DesignController extends ChangeNotifier {
         b.writeln('arithmetic noise cannot be measured:');
         b.writeln('  $noiseError');
       } else if (noise != null) {
-        var worst = double.negativeInfinity;
-        for (final v in noise.noiseDb) {
-          if (v > worst) worst = v;
-        }
+        final worst = noise.worstDb;
         b.writeln();
         b.writeln('arithmetic noise  (measured through the datapath'
             '${isIir ? '' : ', $structure${folded ? ' folded' : ''}'})');

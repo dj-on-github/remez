@@ -60,6 +60,26 @@ extension StructureName on Structure {
 /// RMS of the noise used to measure a datapath, as a fraction of full scale.
 const double noiseLevel = 0.25;
 
+/// The widest datapath this model can represent.
+///
+/// A Dart int is 64 bits, and every node of the modelled datapath is one. The
+/// Python this is ported from has no such limit -- its integers grow to fit --
+/// but a datapath wider than a machine word is not something anyone builds, and
+/// refusing is better than the wrapped arithmetic that would otherwise come out
+/// looking like a filter.
+const int maxDatapathBits = 63;
+
+/// Check that a word this wide can be modelled at all.
+void checkDatapathWidth(int wcoef, int headroom) {
+  final width = wcoef + headroom;
+  if (width > maxDatapathBits) {
+    throw DatapathError(
+        'a $wcoef-bit word with $headroom bits of headroom needs a $width-bit '
+        'datapath; the model works in 64-bit integers, so at most '
+        '$maxDatapathBits bits can be represented');
+  }
+}
+
 int _satInt(int value, int width) {
   final lo = -(1 << (width - 1));
   final hi = (1 << (width - 1)) - 1;
@@ -67,12 +87,42 @@ int _satInt(int value, int width) {
 }
 
 /// Exact product, rounded to nearest, saturated into the datapath.
+///
+/// The product is what overflows, not the result: a `wcoef`-bit coefficient
+/// times a `wcoef + headroom`-bit sample needs `2 * wcoef + headroom` bits
+/// before the shift takes them away again, which is 70 for a 32-bit word with
+/// six bits of headroom and 114 at the 53-bit word the quantizer allows. A
+/// Dart int wraps there silently, and the sign flips rather than saturating, so
+/// what comes back is not a filter at all -- and the Python does this in
+/// arbitrary precision, which makes a wrapped product a divergence from the
+/// reference as well as a wrong number.
+///
+/// The narrow case, which is nearly all of them, still multiplies in one
+/// machine word; the two bit lengths that decide it are cheaper than the
+/// division a range check would need. Only the wide case pays for [BigInt].
 int mul(int coef, int sample, int frac, int width) {
-  var product = coef * sample;
-  if (frac > 0) {
-    product = (product + (1 << (frac - 1))) >> frac;
+  // The product is at most 2^(bitLength sum), and the rounding term at most
+  // 2^(frac - 1), so this bound leaves both inside a signed 64-bit int.
+  if (frac < 62 && coef.bitLength + sample.bitLength <= 62) {
+    var product = coef * sample;
+    if (frac > 0) {
+      product = (product + (1 << (frac - 1))) >> frac;
+    }
+    return _satInt(product, width);
   }
-  return _satInt(product, width);
+  return _mulWide(coef, sample, frac, width);
+}
+
+int _mulWide(int coef, int sample, int frac, int width) {
+  var product = BigInt.from(coef) * BigInt.from(sample);
+  if (frac > 0) {
+    product = (product + (BigInt.one << (frac - 1))) >> frac;
+  }
+  final lo = -(1 << (width - 1));
+  final hi = (1 << (width - 1)) - 1;
+  if (product < BigInt.from(lo)) return lo;
+  if (product > BigInt.from(hi)) return hi;
+  return product.toInt();
 }
 
 /// Saturating add.
@@ -199,6 +249,7 @@ List<int> simulateFir(
   bool folded = false,
   Symmetry symmetry = Symmetry.symmetric,
 }) {
+  checkDatapathWidth(wcoef, headroom);
   final width = wcoef + headroom;
   final n = taps.length;
   final terms = firTerms(n, symmetry, folded);
@@ -241,6 +292,7 @@ List<int> simulateIir(
   int wcoef,
   int headroom,
 ) {
+  checkDatapathWidth(wcoef, headroom);
   final width = wcoef + headroom;
   final state = [for (var _ in sections) [0, 0]];
   final out = <int>[];
@@ -287,6 +339,17 @@ class NoiseFloor {
     final sorted = Float64List.fromList(noiseDb)..sort();
     return sorted[sorted.length ~/ 2];
   }
+
+  /// The loudest frequency of the noise, which is what says whether the
+  /// datapath is rounding or clipping: rounding noise sits far below the
+  /// input, and anything approaching it is saturation somewhere in the chain.
+  double get worstDb {
+    var worst = double.negativeInfinity;
+    for (final v in noiseDb) {
+      if (v > worst) worst = v;
+    }
+    return worst;
+  }
 }
 
 /// Measure the arithmetic noise the datapath adds, as a spectrum.
@@ -314,6 +377,9 @@ NoiseFloor noiseResponse(
         'is not a datapath that can be measured; give the coefficients more '
         'bits');
   }
+  // Checked here as well as in the simulators, because the drive level below
+  // is worked out from the width before anything is run through it.
+  checkDatapathWidth(wcoef, headroom);
   const segment = 512;
   final n = math.max(length ?? 1 << 14, 8 * segment);
 

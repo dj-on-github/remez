@@ -25,6 +25,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:remez/src/complex.dart';
 import 'package:remez/src/fixed_point.dart';
 import 'package:remez/src/iir_core.dart';
 
@@ -181,6 +182,60 @@ void main() {
         expect(res.sos[s][0].abs(), greaterThan(0.01),
             reason: 'section $s should carry a representable share');
       }
+    });
+
+    /// The peak gain of the cascade up to and including each section: the level
+    /// the node between that section and the next has to carry.
+    List<double> nodePeaks(IIRResult res) {
+      const points = 8192;
+      final w = Float64List(points);
+      for (var i = 0; i < points; i++) {
+        w[i] = math.pi * i / (points - 1);
+      }
+      final running = List<Complex>.filled(points, Complex.one);
+      final peaks = <double>[];
+      for (var s = 0; s < res.sos.length; s++) {
+        final h = sosFreqz([res.sos[s]], w);
+        var peak = 0.0;
+        for (var i = 0; i < points; i++) {
+          running[i] = running[i] * h[i];
+          if (running[i].abs > peak) peak = running[i].abs;
+        }
+        peaks.add(peak);
+      }
+      return peaks;
+    }
+
+    test('leaves no node between two sections above unit gain', () {
+      // The failure this pins is not a wrong filter but a saturating one: a
+      // node driven past full scale clips, and clipping is the same size at
+      // any word length, so no amount of extra precision or headroom shows it
+      // up. These are the sharpest designs the tool makes -- high-Q poles are
+      // what put a peak inside the cascade that the ends do not show.
+      final designs = {
+        'narrow butterworth bandpass': narrow(),
+        'sharp elliptic lowpass': design('lowpass', 'elliptic',
+            wp: [6400], ws: [6700], rp: 0.5, rs: 70, fs: 32000),
+        'sharp chebyshev1 highpass': design('highpass', 'chebyshev1',
+            wp: [6700], ws: [6400], rp: 0.5, rs: 70, fs: 32000),
+        'narrow elliptic bandstop': design('bandstop', 'elliptic',
+            wp: [2000, 4000], ws: [2900, 3100], rp: 0.5, rs: 60, fs: 32000),
+      };
+      designs.forEach((name, res) {
+        final peaks = nodePeaks(res);
+        expect(peaks.length, res.sos.length, reason: name);
+        // The last node is the output, which carries the filter's own gain;
+        // every node before it is scaled to unit peak. The grid here is
+        // denser than the one the scaling used, so a resonance can come out a
+        // shade higher than one -- a fraction of a dB, not a factor.
+        for (var s = 0; s < peaks.length - 1; s++) {
+          expect(peaks[s], lessThan(1.02),
+              reason: '$name: node after section $s peaks at ${peaks[s]}');
+        }
+        for (final p in peaks) {
+          expect(p, greaterThan(0.0), reason: name);
+        }
+      });
     });
 
     test('still multiplies back to the gain it started with', () {

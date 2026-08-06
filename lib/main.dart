@@ -811,22 +811,61 @@ class _Controls extends StatelessWidget {
             ],
           ),
         ),
-        _Panel(
-          title: 'Result',
-          child: SizedBox(
-            height: 260,
-            child: Scrollbar(
-              child: SingleChildScrollView(
-                child: SelectableText(
-                  c.report(),
-                  style: const TextStyle(
-                      fontFamily: 'monospace', fontSize: 11, height: 1.35),
-                ),
-              ),
+        _Panel(title: 'Result', child: _ReportBox(text: c.report())),
+      ],
+    );
+  }
+}
+
+/// The report, in a box of its own that scrolls independently of the column.
+///
+/// The scrollbar and the scroll view under it are given the same controller,
+/// which sounds like a formality and is not. A `Scrollbar` with no controller
+/// falls back to the `PrimaryScrollController`, and on a desktop platform
+/// nothing attaches itself to that one -- a `ScrollView` only adopts it
+/// automatically on mobile -- so the first scroll of the report asserts that
+/// there is no position to draw a thumb for. On mobile it happens to work,
+/// because the column's own `ListView` takes the primary controller and the
+/// scrollbar finds a position on it: the wrong one, but an attached one.
+class _ReportBox extends StatefulWidget {
+  const _ReportBox({required this.text});
+
+  final String text;
+
+  @override
+  State<_ReportBox> createState() => _ReportBoxState();
+}
+
+class _ReportBoxState extends State<_ReportBox> {
+  final ScrollController _scroll = ScrollController();
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 260,
+      child: Scrollbar(
+        controller: _scroll,
+        child: ScrollConfiguration(
+          // The desktop scroll behaviour adds a scrollbar of its own to every
+          // scroll view; without this the box would carry two, drawn one on
+          // top of the other.
+          behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+          child: SingleChildScrollView(
+            controller: _scroll,
+            child: SelectableText(
+              widget.text,
+              style: const TextStyle(
+                  fontFamily: 'monospace', fontSize: 11, height: 1.35),
             ),
           ),
         ),
-      ],
+      ),
     );
   }
 }

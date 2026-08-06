@@ -175,9 +175,9 @@ module biq #(
 );
     // Five stored integers per section, in the order b0 b1 b2 a1 a2.
     localparam longint COEF [0:NCOEF-1] = '{
-        2431, 4863, 2431, -19982, 7209,
-        2431, 4863, 2431, -13930, 10148,
-        2431, 4863, 2431, -9119, 14147
+        903, 1806, 903, -19982, 7209,
+        3109, 6219, 3109, -13930, 10148,
+        5120, 10241, 5120, -9119, 14147
     };
 
     // chain[0] is the input; chain[s+1] is the output of section s.

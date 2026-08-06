@@ -146,6 +146,14 @@ RtlPlan planFor(String kind, Object res, fx.Fixed? fixed, RtlOptions opts) {
   if (headroom < 0 || headroom > 64) {
     throw RtlError('headroom must be 0..64 bits, got $headroom');
   }
+  // The RTL itself would be fine at any width; the model that generates the
+  // testbench's expected values is what cannot go past a machine word.
+  if (fixed.bits + headroom > dp.maxDatapathBits) {
+    throw RtlError(
+        'a ${fixed.bits}-bit word with $headroom bits of headroom needs a '
+        '${fixed.bits + headroom}-bit datapath, which is wider than the '
+        '${dp.maxDatapathBits} bits the model can simulate to check it');
+  }
   if (fixed.fracBits < 0) {
     throw RtlError(
         'the binary point is ${-fixed.fracBits} places into the integer '

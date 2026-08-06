@@ -728,24 +728,60 @@ List<Float64List> zpkToSos(List<Complex> zIn, List<Complex> pIn, double k) {
   return sections;
 }
 
-/// Multiply the section numerators by [k], an even share to each.
+/// Multiply the section numerators by [k], scaled so no node between two
+/// sections has a peak gain above one.
 ///
-/// The last section takes whatever is left rather than another copy of the
-/// root, so that the sections multiply back to exactly [k] however the root
-/// rounded. A zero gain, and a single section, both fall out of this as the
-/// old whole-gain-in-one-section case.
-void _spreadGain(List<Float64List> sections, double k) {
+/// Where the gain goes decides two different things, and both of them bite.
+/// Put it all in the first section, as the textbook zpk-to-cascade does, and a
+/// sharp narrow-band design whose k is 1e-10 has a numerator that quantizes to
+/// zero and kills the cascade. Share it out evenly instead and the numerators
+/// are representable, but nothing is looking at where the resonances are: a
+/// section whose poles sit at 0.99 has a peak gain of its own, and with the
+/// gain no longer taken out at the input the node behind it overflows. What
+/// comes out then is not rounding error but clipping, which no amount of extra
+/// word length or headroom will improve.
+///
+/// So each section takes the share that brings the running cascade's peak back
+/// to one, measured on a fixed grid of [npoints] frequencies, and the last
+/// takes whatever is left -- which puts the output at the filter's own gain,
+/// and makes the sections multiply back to exactly [k] however the shares
+/// rounded. The grid is dense enough to resolve a resonance a few thousandths
+/// of a radian wide; missing a peak by a fraction of a dB only means a node
+/// scaled slightly high, not a wrong filter.
+void _spreadGain(List<Float64List> sections, double k, {int npoints = 4096}) {
   final n = sections.length;
-  var share = 1.0;
-  if (n > 1 && k != 0.0) {
-    share = math.pow(k.abs(), 1.0 / n).toDouble();
+  if (n == 1 || k == 0.0) {
+    for (var i = 0; i < 3; i++) {
+      sections[0][i] *= k;
+    }
+    return;
   }
+
+  final w = Float64List(npoints);
+  for (var i = 0; i < npoints; i++) {
+    w[i] = math.pi * i / (npoints - 1);
+  }
+
+  final running = List<Complex>.filled(npoints, Complex.one);
   var rest = k;
   for (var s = 0; s < n - 1; s++) {
-    for (var i = 0; i < 3; i++) {
-      sections[s][i] *= share;
+    final h = sosFreqz([sections[s]], w);
+    var peak = 0.0;
+    for (var i = 0; i < npoints; i++) {
+      running[i] = running[i] * h[i];
+      final m = running[i].abs;
+      if (m > peak) peak = m;
     }
-    rest /= share;
+    // A section cannot have an all-zero numerator here -- they come out of
+    // `_fromRoots` monic -- but a peak of zero would still not be a scale.
+    final g = peak > 0 && peak.isFinite ? 1.0 / peak : 1.0;
+    for (var i = 0; i < 3; i++) {
+      sections[s][i] *= g;
+    }
+    for (var i = 0; i < npoints; i++) {
+      running[i] = running[i].scale(g);
+    }
+    rest /= g;
   }
   for (var i = 0; i < 3; i++) {
     sections[n - 1][i] *= rest;

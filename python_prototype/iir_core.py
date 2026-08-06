@@ -469,20 +469,45 @@ def zpk_to_sos(z, p, k):
     return out
 
 
-def _spread_gain(sos, k):
-    """Multiply the section numerators by ``k``, an even share to each.
+def _spread_gain(sos, k, npoints=4096):
+    """Multiply the section numerators by ``k``, scaled so no node between two
+    sections has a peak gain above one.
 
-    The last section takes whatever is left rather than another copy of the
-    root, so that the sections multiply back to exactly ``k`` however the root
-    rounded.  A zero gain, and a single section, both fall out of this as the
-    old whole-gain-in-one-section case.
+    Where the gain goes decides two different things, and both of them bite.
+    Put it all in the first section, as the textbook zpk-to-cascade does, and a
+    sharp narrow-band design whose k is 1e-10 has a numerator that quantizes to
+    zero and kills the cascade.  Share it out evenly instead and the numerators
+    are representable, but nothing is looking at where the resonances are: a
+    section whose poles sit at 0.99 has a peak gain of its own, and with the
+    gain no longer taken out at the input the node behind it overflows.  What
+    comes out then is not rounding error but clipping, which no amount of extra
+    word length or headroom will improve.
+
+    So each section takes the share that brings the running cascade's peak back
+    to one, measured on a fixed grid of ``npoints`` frequencies, and the last
+    takes whatever is left -- which puts the output at the filter's own gain,
+    and makes the sections multiply back to exactly ``k`` however the shares
+    rounded.  The grid is dense enough to resolve a resonance a few thousandths
+    of a radian wide; missing a peak by a fraction of a dB only means a node
+    scaled slightly high, not a wrong filter.
     """
     n = len(sos)
-    share = abs(k) ** (1.0 / n) if n > 1 and k != 0.0 else 1.0
+    if n == 1 or k == 0.0:
+        sos[0, :3] *= k
+        return
+
+    w = np.pi * np.arange(npoints) / (npoints - 1)
+    running = np.ones(npoints, dtype=complex)
     rest = k
     for s in range(n - 1):
-        sos[s, :3] *= share
-        rest /= share
+        running = running * sos_freqz(sos[s:s + 1], w)
+        peak = float(np.max(np.abs(running)))
+        # A section cannot have an all-zero numerator here -- they come out of
+        # np.poly monic -- but a peak of zero would still not be a scale.
+        g = 1.0 / peak if peak > 0 and np.isfinite(peak) else 1.0
+        sos[s, :3] *= g
+        running = running * g
+        rest /= g
     sos[n - 1, :3] *= rest
 
 
