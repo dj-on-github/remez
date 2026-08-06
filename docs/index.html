@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>remez — digital filter designer</title>
+  <meta name="description" content="Design FIR and IIR digital filters in your browser. Parks–McClellan (Remez) FIR design and classical IIR design, with live plots, fixed-point arithmetic, and C, RTL, and coefficient exports." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d1117;
+      --panel: #161b22;
+      --panel-2: #1c2230;
+      --ink: #e6edf3;
+      --ink-soft: #9aa7b4;
+      --ink-faint: #6b7681;
+      --trace: #3fb950;      /* oscilloscope green */
+      --trace-dark: #2ea043;
+      --accent: #58a6ff;      /* passband blue */
+      --accent-2: #d29922;    /* stopband amber */
+      --grid: rgba(88, 166, 255, 0.06);
+      --border: #262f3c;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.65;
+      /* faint graph-paper grid */
+      background-image:
+        repeating-linear-gradient(0deg, var(--grid) 0, var(--grid) 1px, transparent 1px, transparent 26px),
+        repeating-linear-gradient(90deg, var(--grid) 0, var(--grid) 1px, transparent 1px, transparent 26px);
+    }
+    a { color: var(--accent); }
+    h1, h2, h3 { font-family: "IBM Plex Sans", sans-serif; letter-spacing: -0.01em; }
+    code, .mono { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    /* Header */
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 24px;
+      background: rgba(13, 17, 23, 0.85);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 1.35rem;
+      font-weight: 600;
+      color: var(--ink);
+      line-height: 1;
+    }
+    .brand img { width: 30px; height: 30px; border-radius: 6px; }
+    .brand .caret { color: var(--trace); }
+    a.button {
+      display: inline-block;
+      background: var(--trace);
+      color: #08130a;
+      text-decoration: none;
+      padding: 11px 24px;
+      border-radius: 8px;
+      font-family: "IBM Plex Sans", sans-serif;
+      font-size: 1rem;
+      font-weight: 700;
+      white-space: nowrap;
+      transition: background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    a.button:hover {
+      background: var(--trace-dark);
+      transform: translateY(-1px);
+      box-shadow: 0 8px 24px rgba(63, 185, 80, 0.25);
+    }
+
+    /* Layout */
+    main { max-width: 980px; margin: 0 auto; padding: 0 24px 80px; }
+
+    /* Hero */
+    .hero { padding: 64px 0 36px; text-align: center; }
+    .kicker {
+      display: inline-block;
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.9rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--trace);
+      margin-bottom: 14px;
+    }
+    .hero h1 { font-size: 3rem; margin: 0 0 16px; line-height: 1.08; }
+    .hero h1 .caret { color: var(--trace); }
+    .hero p.tagline {
+      color: var(--ink-soft);
+      font-size: 1.2rem;
+      max-width: 680px;
+      margin: 0 auto 30px;
+    }
+    .cta-row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 40px; }
+    a.button.ghost {
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--border);
+    }
+    a.button.ghost:hover { background: var(--panel-2); box-shadow: none; }
+    .hero-frame {
+      display: inline-block;
+      padding: 10px;
+      background: var(--panel);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+    }
+    .hero-img { display: block; max-width: 100%; height: auto; border-radius: 6px; }
+
+    /* Sections */
+    section { margin-top: 64px; }
+    section h2 { font-size: 1.8rem; margin: 0 0 20px; text-align: center; }
+    section h2 .rule {
+      display: block;
+      width: 80px;
+      height: 0;
+      margin: 12px auto 0;
+      border-top: 2px solid var(--trace);
+    }
+    .lead { color: var(--ink-soft); font-size: 1.05rem; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 28px 32px;
+    }
+
+    /* Feature grid */
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+    }
+    .feature {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 22px 22px 20px;
+      transition: border-color 0.15s ease, transform 0.15s ease;
+    }
+    .feature:hover { border-color: var(--trace); transform: translateY(-2px); }
+    .feature .tag { font-family: "IBM Plex Mono", monospace; font-size: 0.85rem; color: var(--trace); }
+    .feature h3 { margin: 8px 0 6px; font-size: 1.12rem; }
+    .feature p { margin: 0; color: var(--ink-soft); font-size: 0.95rem; }
+
+    /* Steps */
+    ol.steps { padding-left: 22px; margin: 0; }
+    ol.steps li { margin-bottom: 10px; color: var(--ink-soft); }
+    ol.steps li::marker { color: var(--trace); font-weight: 700; font-family: "IBM Plex Mono", monospace; }
+    ol.steps li strong { color: var(--ink); }
+    ol.steps code { color: var(--accent); background: var(--panel-2); padding: 1px 6px; border-radius: 4px; font-size: 0.9em; }
+
+    /* export chips */
+    .chips { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+    .chip {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.9rem;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 7px 16px;
+      color: var(--ink);
+    }
+
+    .note {
+      margin-top: 22px;
+      color: var(--ink-soft);
+      font-size: 0.9rem;
+      background: var(--panel-2);
+      border-left: 3px solid var(--accent-2);
+      border-radius: 6px;
+      padding: 14px 16px;
+    }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 30px 24px;
+      text-align: center;
+      color: var(--ink-faint);
+      font-size: 0.9rem;
+    }
+    footer a { color: var(--ink-soft); margin: 0 8px; text-decoration: none; }
+    footer a:hover { color: var(--trace); text-decoration: underline; }
+
+    @media (max-width: 520px) {
+      .hero h1 { font-size: 2.1rem; }
+      .brand span.name { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <img src="https://github.com/dj-on-github/remez/raw/main/web/icons/Icon-192.png" alt="remez icon" />
+      <span class="name"><span class="caret">&gt;</span> remez</span>
+    </div>
+    <a class="button" href="app/">Launch the Web App</a>
+  </header>
+
+  <main>
+    <section class="hero">
+      <span class="kicker">FIR &amp; IIR · digital filter design</span>
+      <h1><span class="caret">&gt;</span> remez</h1>
+      <p class="tagline">
+        A digital filter designer for your browser. Type a specification, watch the
+        response redraw as you go, then export the coefficients, C, or synthesizable RTL.
+      </p>
+      <div class="cta-row">
+        <a class="button" href="app/">Launch the Web App</a>
+        <a class="button ghost" href="https://github.com/dj-on-github/remez/blob/main/docs/tutorial.md">Read the Tutorial</a>
+      </div>
+      <div class="hero-frame">
+        <img
+          class="hero-img"
+          src="https://github.com/dj-on-github/remez/raw/main/docs/images/response-lowpass.png"
+          alt="A lowpass magnitude response with passband, transition, and stopband labelled"
+        />
+      </div>
+    </section>
+
+    <section>
+      <h2>Design as you type<span class="rule"></span></h2>
+      <div class="card">
+        <p class="lead">
+          You enter a specification on the left and remez designs the filter and plots the
+          result on the right, redrawing on every keystroke. Two families are on offer:
+          <strong>FIR</strong> by the Parks–McClellan (Remez) exchange — linear phase,
+          unconditionally stable, as many taps as it takes — and <strong>IIR</strong> by the
+          bilinear transform of a classical analogue prototype — far fewer coefficients for
+          the same selectivity. When you like what you see, you export it.
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>What it does<span class="rule"></span></h2>
+      <div class="features">
+        <div class="feature">
+          <span class="tag">FIR</span>
+          <h3>Parks–McClellan</h3>
+          <p>All four linear-phase types, multiband, weighting and inverse-f weighting, with a live equiripple response.</p>
+        </div>
+        <div class="feature">
+          <span class="tag">IIR</span>
+          <h3>Classical prototypes</h3>
+          <p>Butterworth, Chebyshev I &amp; II and elliptic, as lowpass, highpass, bandpass or bandstop.</p>
+        </div>
+        <div class="feature">
+          <span class="tag">PLOTS</span>
+          <h3>See the result</h3>
+          <p>Magnitude, weighted error and impulse response, plus the filter drawn as a biquad cascade or tapped delay line.</p>
+        </div>
+        <div class="feature">
+          <span class="tag">FIXED-POINT</span>
+          <h3>Quantize it</h3>
+          <p>Taps and biquad sections in fixed point, with the binary point placed automatically and the noise floor measured.</p>
+        </div>
+        <div class="feature">
+          <span class="tag">EXPORT</span>
+          <h3>C &amp; coefficients</h3>
+          <p>A self-contained C library and program, or the coefficients alone as CSV or a C header.</p>
+        </div>
+        <div class="feature">
+          <span class="tag">RTL</span>
+          <h3>SystemVerilog &amp; VHDL</h3>
+          <p>Chain, adder tree or one reused multiplier, folded or not, each with a self-checking testbench.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Five-minute version<span class="rule"></span></h2>
+      <div class="card">
+        <ol class="steps">
+          <li>Launch the web app and leave <strong>Mode</strong> on <em>FIR</em>.</li>
+          <li>In <strong>Filter</strong>, set the <strong>sample rate</strong> so the band edges read in Hz.</li>
+          <li>In <strong>Bands and constraints</strong>, set the passband and stopband edges.</li>
+          <li>Watch the top plot. If the stopband is not deep enough, raise <strong>Taps</strong>.</li>
+          <li>Choose an export: coefficients as a <code>.csv</code> or C header, a compilable <code>.c</code>, or RTL.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Exports<span class="rule"></span></h2>
+      <div class="card">
+        <p class="lead">Everything the design produces, ready to drop into your project:</p>
+        <div class="chips">
+          <span class="chip">Coefficients (.csv)</span>
+          <span class="chip">C header (.h)</span>
+          <span class="chip">C library + program (.c)</span>
+          <span class="chip">SystemVerilog (.sv)</span>
+          <span class="chip">VHDL-93 (.vhd)</span>
+          <span class="chip">Design (.remz / .json)</span>
+          <span class="chip">Plot (.png)</span>
+        </div>
+        <p class="note">
+          remez also runs as a desktop app on Windows, macOS and Linux, and from a terminal it
+          takes a <code class="mono">.remz</code> design file and answers <code class="mono">--help</code>
+          and <code class="mono">--version</code> without opening a window.
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a href="https://github.com/dj-on-github/remez">Project on GitHub</a>
+    <a href="https://github.com/dj-on-github/remez/blob/main/docs/tutorial.md">Tutorial</a>
+    <a href="https://github.com/dj-on-github/remez/issues">Report an issue</a>
+  </footer>
+</body>
+</html>
