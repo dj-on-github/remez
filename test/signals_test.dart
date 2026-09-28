@@ -9,7 +9,9 @@ library;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:remez/main.dart';
 import 'package:remez/src/controller.dart';
 import 'package:remez/src/datapath.dart';
 import 'package:remez/src/signals.dart';
@@ -101,6 +103,36 @@ void main() {
 
     test('it returns one sample per sample in', () {
       expect(convolve(Float64List(41), Float64List(100)), hasLength(100));
+    });
+  });
+
+  group('on screen', () {
+    testWidgets('a refused length says so where the plot would have been',
+        (tester) async {
+      tester.view.physicalSize = const Size(1500, 1200);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      await tester.pumpWidget(const RemezApp());
+      await tester.pumpAndSettle();
+      final state =
+          tester.state<State<DesignerPage>>(find.byType(DesignerPage));
+      // ignore: avoid_dynamic_calls
+      final c = (state as dynamic).controller as DesignController;
+
+      c.update(() {
+        c.showSignal = true;
+        c.signalLength = 100000;
+      });
+      await tester.pumpAndSettle();
+      // The painter draws the reason, so it is the semantics that carry it.
+      expect(c.signalError, contains('100000 samples is outside'));
+      expect(find.textContaining('through the filter'), findsOneWidget,
+          reason: 'the plot keeps its heading, so the refusal has a place');
+
+      c.update(() => c.signalLength = 256);
+      await tester.pumpAndSettle();
+      expect(c.signalError, isNull);
     });
   });
 
@@ -258,6 +290,55 @@ void main() {
       final before = c.signalRun();
       c.update(() => c.testSignal = TestSignal.step);
       expect(identical(c.signalRun(), before), isFalse);
+    });
+
+    test('a length outside the bounds is refused, not quietly cut down', () {
+      for (final n in [0, 1, 15, 8193, 100000]) {
+        final c = DesignController()
+          ..showSignal = true
+          ..signalLength = n
+          ..design();
+        expect(c.signalRun(), isNull, reason: '$n samples');
+        expect(c.signalError, contains('$n samples is outside'),
+            reason: '$n samples');
+        expect(c.report(), contains('no signal was run'));
+      }
+    });
+
+    test('the bounds themselves are allowed', () {
+      for (final n in [
+        DesignController.minSignalLength,
+        DesignController.maxSignalLength,
+      ]) {
+        final c = DesignController()
+          ..showSignal = true
+          ..signalLength = n
+          ..design();
+        final run = c.signalRun();
+        expect(c.signalError, isNull, reason: '$n samples');
+        expect(run!.input, hasLength(n),
+            reason: 'exactly what was asked for, not a rounded version');
+      }
+    });
+
+    test('an accepted length is used in full', () {
+      final c = DesignController()
+        ..showSignal = true
+        ..signalLength = 777
+        ..design();
+      expect(c.signalRun()!.input, hasLength(777));
+      expect(c.signalRun()!.output, hasLength(777));
+    });
+
+    test('fixing the length clears the refusal', () {
+      final c = DesignController()
+        ..showSignal = true
+        ..signalLength = 99999
+        ..design();
+      expect(c.signalError, isNotNull);
+      c.update(() => c.signalLength = 512);
+      expect(c.signalError, isNull);
+      expect(c.signalRun()!.input, hasLength(512));
     });
 
     test('the settings round trip through the design file', () {

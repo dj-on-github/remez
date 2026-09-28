@@ -391,6 +391,12 @@ the plots and the report show the filter you would actually build.
     largest coefficient just fits. Turn it off to set the fraction length
     yourself. \\
   \addlinespace
+  \ctl{Module name} & What the generated module is called, and with it the two
+    files it goes in. It used to be taken from the name typed into the save
+    dialog; the RTL export asks for a folder now, so the name is a setting like
+    any other and is saved with the design. Anything not usable as an
+    identifier is folded to lower case with underscores. \\
+  \addlinespace
   \ctl{Structure} & How the multiplies are summed in hardware: \lit{chain} (one
     adder per tap --- smallest, slowest), \lit{tree} (balanced, registered
     between levels --- fastest), \lit{mac} (one multiplier reused, one term per
@@ -473,9 +479,13 @@ the failure that rounding a high-order elliptic design really produces.
     the target before the hardware exists. Needs fixed point. \\
   \addlinespace
   \ctl{Generate SV\dots}, \ctl{Generate VHDL\dots} & Synthesisable RTL for the
-    structure chosen in \ctl{Arithmetic}, with its testbench. Both need
-    fixed-point coefficients; until then they are disabled and the tooltip says
-    why. \\
+    structure chosen in \ctl{Arithmetic}, with its testbench. These two ask for
+    a \emph{folder} rather than a file name, because they write a pair of files
+    --- \lit{<module>.sv} and \lit{<module>\_tb.sv} --- and a save dialog on a
+    sandboxed desktop grants only the one file named in it, which left the
+    testbench unwritable. The files are named after \ctl{Module name} in the
+    \ctl{Arithmetic} panel. Both need fixed-point coefficients; until then they
+    are disabled and the tooltip says why. \\
   \bottomrule
 \end{tabularx}
 
@@ -542,6 +552,11 @@ legible one.
   \ctl{square} & harmonics, and what happens to the ones the filter removes \\
   \bottomrule
 \end{tabularx}
+
+\ctl{Samples} is how long a run to make, from 16 to 8192. Ask for something
+outside that and it refuses and says so, rather than quietly running a
+different number --- being handed 8192 samples when you asked for 100\,000,
+with nothing said, is how a measurement gets misread.
 
 In fixed point it runs the signal twice: once through the design in double
 precision and once through the exact integer datapath. Both are drawn, and the
@@ -934,9 +949,9 @@ attenuation in dB. \lit{order} applies when \lit{auto\_order} is false.
 \paragraph{\lit{arithmetic}.} \lit{kind} is \lit{"float"} or \lit{"fixed"}. The
 rest are the Arithmetic panel's fields: \lit{word\_bits}, \lit{auto\_frac},
 \lit{frac\_bits}, \lit{headroom}, and the hardware options \lit{fixed\_coeffs},
-\lit{structure} (\lit{"chain"}, \lit{"tree"} or \lit{"mac"}), \lit{folded} and
-\lit{testbench}. \lit{measure\_noise} and \lit{sensitivity} switch on the two
-analyses.
+\lit{structure} (\lit{"chain"}, \lit{"tree"} or \lit{"mac"}), \lit{folded},
+\lit{testbench} and \lit{module\_name}. \lit{measure\_noise} and
+\lit{sensitivity} switch on the two analyses.
 
 \paragraph{\lit{display}.} \lit{log\_scale}, \lit{view} (\lit{"Plot view"} or
 \lit{"Design view"}) and \lit{appearance} (\lit{"system"}, \lit{"light"} or

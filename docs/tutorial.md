@@ -202,6 +202,7 @@ plots and the report show the filter you would actually build.
 | **Word bits** | Coefficient word length. |
 | **Headroom** | Extra integer bits in the datapath, above the coefficient format. This is what keeps the adders off their limits; 2 is a sensible default. |
 | **Place the binary point automatically** | Puts the binary point where the largest coefficient just fits. Turn it off to set the fraction length yourself. |
+| **Module name** | What the generated module is called, and with it the two files it goes in. It used to be taken from the name typed into the save dialog; the RTL export asks for a folder now, so the name is a setting like any other and is saved with the design. Anything not usable as an identifier is folded to lower case with underscores. |
 | **Structure** | How the multiplies are summed in hardware: `chain` (one adder per tap — smallest, slowest), `tree` (balanced, registered between levels — fastest), `mac` (one multiplier reused, one term per clock — smallest of all, one sample per N clocks). |
 | **Fold the symmetric taps** | A linear-phase filter has equal taps in pairs, so one pre-add plus one multiply serves two of them. Roughly halves the multipliers. |
 | **Coefficients as constants** | Compile them into the RTL so synthesis can specialise each multiplier. Turn it off for a runtime coefficient port. |
@@ -243,7 +244,7 @@ that rounding a high-order elliptic design really produces.
 | **Save C…** | One self-contained C file: a library (`init_filter` / `process_sample` / `free_filter`) and a program that filters raw 64-bit floats from stdin to stdout. |
 | **Save script…** | A NumPy module or a MATLAB function, chosen by the extension you give it — `.py` or `.m`. Both define the coefficients and call the library routine; an FIR goes to `lfilter`/`filter`, a cascade to `sosfilt`. |
 | **Save integer C…** | The same filter with no floating point anywhere: signed integers, products rounded and saturated, sums saturated, in the order the chosen structure sums them. It is the *same* arithmetic as the generated RTL, bit for bit, which makes it the reference model to run on the target before the hardware exists. Needs fixed point. |
-| **Generate SV…**, **Generate VHDL…** | Synthesisable RTL for the structure chosen in **Arithmetic**, with its testbench. Both need fixed-point coefficients; until then they are disabled and the tooltip says why. |
+| **Generate SV…**, **Generate VHDL…** | Synthesisable RTL for the structure chosen in **Arithmetic**, with its testbench. These two ask for a *folder* rather than a file name, because they write a pair of files — `<module>.sv` and `<module>_tb.sv` — and a save dialog on a sandboxed desktop grants only the one file named in it, which left the testbench unwritable. The files are named after **Module name** in the **Arithmetic** panel. Both need fixed-point coefficients; until then they are disabled and the tooltip says why. |
 
 ### Display
 
@@ -294,6 +295,11 @@ legible one.
 | **tone** | one frequency, for gain and delay |
 | **noise** | everything at once, for the noise floor |
 | **square** | harmonics, and what happens to the ones the filter removes |
+
+**Samples** is how long a run to make, from 16 to 8192. Ask for something
+outside that and it refuses and says so, rather than quietly running a
+different number — being handed 8192 samples when you asked for 100 000, with
+nothing said, is how a measurement gets misread.
 
 In fixed point it runs the signal twice: once through the design in double
 precision and once through the exact integer datapath. Both are drawn, and the
@@ -599,8 +605,9 @@ dB. `order` applies when `auto_order` is false.
 
 `kind` is `"float"` or `"fixed"`. The rest are the Arithmetic panel's fields:
 `word_bits`, `auto_frac`, `frac_bits`, `headroom`, and the hardware options
-`fixed_coeffs`, `structure` (`"chain"`, `"tree"` or `"mac"`), `folded` and
-`testbench`. `measure_noise` and `sensitivity` switch on the two analyses.
+`fixed_coeffs`, `structure` (`"chain"`, `"tree"` or `"mac"`), `folded`,
+`testbench` and `module_name`. `measure_noise` and `sensitivity` switch on the
+two analyses.
 
 **`display`**
 

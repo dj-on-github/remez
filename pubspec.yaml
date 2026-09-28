@@ -37,6 +37,8 @@ dependencies:
   file_selector: ^1.1.0
 
 dev_dependencies:
+  # Used by the RTL export test to stand in for the save dialogs.
+  file_selector_platform_interface: ^2.6.0
   flutter_test:
     sdk: flutter
 

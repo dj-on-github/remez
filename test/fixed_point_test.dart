@@ -353,7 +353,7 @@ void main() {
           q.fracBits,
           q.bits,
           headroom,
-          length: 1 << 13,
+          minLength: 1 << 13,
         );
         expect(measured.rmsLsb,
             closeTo(math.sqrt(res.numtaps / 12.0), math.sqrt(res.numtaps / 12.0) * 0.3));

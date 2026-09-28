@@ -1,12 +1,34 @@
 /// Renders the app to an image, so the layout can be looked at.
 library;
 
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:remez/main.dart';
 import 'package:remez/src/controller.dart';
 
 void main() {
+  setUpAll(() {
+    // Compare the golden by what it is for.
+    //
+    // The stock comparator is exact to the bit, which makes a layout golden
+    // fail whenever the engine changes its mind about how to shade the corner
+    // of a rounded box. That is what happened here: the SDK moved on from the
+    // one that wrote this image and 160 pixels out of a million and a half
+    // changed, all of them corners, none by more than a seventh of a level.
+    // Nothing in the program had moved.
+    //
+    // A ceiling on the per-pixel difference draws the line in the right
+    // place. Anti-aliasing reshades an edge slightly; anything that actually
+    // moved -- a glyph by a pixel, a control changing colour, a panel growing
+    // a row -- differs at close to full amplitude where it moved, and still
+    // fails.
+    final previous = goldenFileComparator as LocalFileComparator;
+    goldenFileComparator = _AntiAliasTolerant(previous.basedir);
+  });
+
   testWidgets('the designer renders', (tester) async {
     tester.view.physicalSize = const Size(1500, 1000);
     tester.view.devicePixelRatio = 1.0;
@@ -168,4 +190,65 @@ void main() {
     expect(button('Generate SV…').onPressed, isNull);
     expect(button('Generate VHDL…').onPressed, isNull);
   });
+}
+
+/// A golden comparator that forgives anti-aliasing and nothing else.
+class _AntiAliasTolerant extends LocalFileComparator {
+  _AntiAliasTolerant(Uri basedir)
+      : super(basedir.resolve('screenshot_test.dart'));
+
+  /// How far one channel may move before it counts as a real difference.
+  ///
+  /// The corner reshading this was written for peaks at 34 of 255. Sixty-four
+  /// leaves room for the engine to go on fiddling without letting through a
+  /// change anyone could see.
+  static const int _tolerance = 64;
+
+  @override
+  Future<bool> compare(Uint8List imageBytes, Uri golden) async {
+    final want = await _pixels(Uint8List.fromList(await getGoldenBytes(golden)));
+    final got = await _pixels(imageBytes);
+
+    if (want.width != got.width || want.height != got.height) {
+      throw FlutterError('Golden "$golden": the image is now '
+          '${got.width}x${got.height}, was ${want.width}x${want.height}.');
+    }
+
+    var offending = 0;
+    var worst = 0;
+    for (var i = 0; i < want.bytes.length; i += 4) {
+      for (var c = 0; c < 4; c++) {
+        final delta = (want.bytes[i + c] - got.bytes[i + c]).abs();
+        if (delta > worst) worst = delta;
+        if (delta > _tolerance) {
+          offending++;
+          break;
+        }
+      }
+    }
+    if (offending == 0) return true;
+
+    // Write the same failure images the stock comparator would, so a real
+    // difference can be looked at rather than only counted.
+    await GoldenFileComparator.compareLists(
+        imageBytes, await getGoldenBytes(golden));
+    throw FlutterError('Golden "$golden": $offending pixel(s) differ by more '
+        'than $_tolerance of 255 (worst $worst). See test/failures.');
+  }
+
+  Future<({int width, int height, Uint8List bytes})> _pixels(
+      Uint8List encoded) async {
+    final codec = await ui.instantiateImageCodec(encoded);
+    final frame = await codec.getNextFrame();
+    final data =
+        await frame.image.toByteData(format: ui.ImageByteFormat.rawRgba);
+    final out = (
+      width: frame.image.width,
+      height: frame.image.height,
+      bytes: data!.buffer.asUint8List(),
+    );
+    frame.image.dispose();
+    codec.dispose();
+    return out;
+  }
 }

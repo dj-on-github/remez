@@ -198,6 +198,15 @@ class DesignController extends ChangeNotifier {
   bool showSensitivity = false;
 
   // --- what the hardware export should build ---
+  /// What the generated module is called, and with it the files it goes in.
+  ///
+  /// It used to be taken from the name typed into the save dialog, which meant
+  /// the module was named as a side effect of choosing where to put it. The
+  /// RTL export asks for a directory now -- it writes a pair of files and a
+  /// save panel can only grant one -- so the name is a design parameter like
+  /// any other, and lives here where it can be seen and saved.
+  String moduleName = 'filt';
+
   /// Coefficients baked into the RTL as constants, rather than driven in.
   bool fixedCoeffs = true;
   String structure = 'chain';
@@ -213,6 +222,21 @@ class DesignController extends ChangeNotifier {
   /// Phase is off to start with because group delay is its derivative and says
   /// the same thing without the 2*pi steps; the other two are on because they
   /// are the plots that answer a question the magnitude cannot.
+  /// The shortest and longest run the signal plot will make.
+  ///
+  /// Below the floor there is nothing to see: the first samples out of any
+  /// filter are the delay line filling, and a run that is all transient shows
+  /// the transient rather than the filter. The ceiling is where a plot a
+  /// thousand pixels wide stops being able to draw what it is given, and
+  /// where the fixed-point path -- which runs every sample through the
+  /// integer datapath, tap by tap -- starts being felt on every keystroke.
+  ///
+  /// A length outside them is refused rather than quietly moved: being given
+  /// 8192 samples when 100000 were asked for, with nothing said, is how a
+  /// measurement gets misread.
+  static const int minSignalLength = 16;
+  static const int maxSignalLength = 8192;
+
   /// Push a test signal through the filter and plot what comes out.
   bool showSignal = false;
   TestSignal testSignal = TestSignal.chirp;
@@ -402,6 +426,16 @@ class DesignController extends ChangeNotifier {
     _sensitivity = null;
     _pinnedCurve = null;
     _signalRun = null;
+    // Checked here and not where the signal is generated, unlike the noise
+    // measurement's error: that one is only known once the measurement has
+    // been attempted, and this one is a comparison against two constants. So
+    // it can be settled up front, and `signalError` is then always the
+    // answer rather than the answer once something has asked.
+    signalError = showSignal &&
+            (signalLength < minSignalLength || signalLength > maxSignalLength)
+        ? '$signalLength samples is outside $minSignalLength to '
+            '$maxSignalLength, so nothing was run.'
+        : null;
     try {
       if (isIir) {
         _designIir();
@@ -1064,7 +1098,7 @@ class DesignController extends ChangeNotifier {
         headroom,
         // Four thousand samples put the median within a few tenths of a dB of
         // where sixteen thousand put it, at a quarter of the wait.
-        length: 1 << 12,
+        minLength: 1 << 12,
       );
     } on RtlError catch (e) {
       noiseError = e.message;
@@ -1137,11 +1171,11 @@ class DesignController extends ChangeNotifier {
   /// scaled back to the input's units, so the two can be drawn on one axis and
   /// the gap between them read off directly.
   SignalRun? signalRun() {
-    if (!showSignal || !hasResult) return null;
+    if (!showSignal || !hasResult || signalError != null) return null;
     if (_signalRun != null) return _signalRun;
 
     final frequency = double.tryParse(signalFrequency) ?? 0.05;
-    final n = signalLength.clamp(16, 8192);
+    final n = signalLength;
     final x = generate(testSignal, n, fs: fs, frequency: frequency);
     final y = isIir
         ? iir.sosFilter(iirEffective!.sos, x)
@@ -1190,6 +1224,9 @@ class DesignController extends ChangeNotifier {
   }
 
   SignalRun? _signalRun;
+
+  /// Why nothing was run, when something should have been.
+  String? signalError;
 
   /// Where the transfer function goes to zero and to infinity.
   ///
@@ -1328,6 +1365,7 @@ class DesignController extends ChangeNotifier {
         'structure': structure,
         'folded': folded,
         'testbench': wantTestbench,
+        'module_name': moduleName,
         'measure_noise': measureNoise,
         'sensitivity': showSensitivity,
       },
@@ -1431,6 +1469,7 @@ class DesignController extends ChangeNotifier {
     structure = read<String>(arith, 'structure') ?? structure;
     folded = read<bool>(arith, 'folded') ?? folded;
     wantTestbench = read<bool>(arith, 'testbench') ?? wantTestbench;
+    moduleName = read<String>(arith, 'module_name') ?? moduleName;
     measureNoise = read<bool>(arith, 'measure_noise') ?? measureNoise;
     showSensitivity = read<bool>(arith, 'sensitivity') ?? showSensitivity;
 
@@ -1662,6 +1701,13 @@ class DesignController extends ChangeNotifier {
               '${actual > designed + 0.5 ? '   *** the arithmetic is the '
                   'limit, not the filter ***' : ''}');
         }
+      }
+    }
+    if (showSignal) {
+      if (signalError != null) {
+        b.writeln();
+        b.writeln('no signal was run:');
+        b.writeln('  $signalError');
       }
     }
     if (lastDesignTime != null) {

@@ -435,53 +435,111 @@ class _Controls extends StatelessWidget {
   /// One routine for both languages: the hardware is decided by `planFor`, and
   /// the back-ends only render it, so the only thing that differs here is which
   /// pair of functions is called and what the file is called.
+  /// The RTL and its testbench, into a directory the designer chooses.
+  ///
+  /// A directory and not a file. This writes a pair of files, and a save panel
+  /// on a sandboxed desktop grants exactly the one file that was named in it --
+  /// so the testbench, whose path was derived from the RTL's rather than
+  /// chosen, could not be written at all. Choosing the folder grants both.
+  ///
+  /// Both are named after [DesignController.moduleName] rather than after the
+  /// file, which is where the module name used to come from.
   Future<void> _saveRtl(BuildContext context, {required bool verilog}) async {
     final messenger = ScaffoldMessenger.of(context);
     final suffix = verilog ? 'sv' : 'vhd';
-    final type = XTypeGroup(
-        label: verilog ? 'SystemVerilog' : 'VHDL', extensions: [suffix]);
-    final file = await getSaveLocation(
-        acceptedTypeGroups: [type], suggestedName: 'filter.$suffix');
-    if (file == null) return;
-    final path = file.path;
-    final stem = path.split(Platform.pathSeparator).last;
-    final dot = '.$suffix';
-    final opts = RtlOptions(
-      name: stem.endsWith(dot)
-          ? stem.substring(0, stem.length - dot.length)
-          : stem,
-      headroom: controller.headroom,
-      fixedCoeffs: controller.fixedCoeffs,
-      structure: controller.structure,
-      folded: controller.folded,
-    );
+    final name = sanitiseName(controller.moduleName);
+
+    final String source;
+    final String? bench;
     try {
       final kind = controller.isIir ? 'iir' : 'fir';
       final design =
           controller.isIir ? controller.iirResult! : controller.firResult!;
-      final plan = planFor(kind, design, controller.fixed, opts);
-      final source = verilog
+      final plan = planFor(
+        kind,
+        design,
+        controller.fixed,
+        RtlOptions(
+          name: name,
+          headroom: controller.headroom,
+          fixedCoeffs: controller.fixedCoeffs,
+          structure: controller.structure,
+          folded: controller.folded,
+        ),
+      );
+      // Rendered before anything is asked for, so a design that cannot produce
+      // hardware says so without first sending the designer off to pick a
+      // folder for files that were never going to be written.
+      source = verilog
           ? (kind == 'iir' ? sv.renderIir(plan) : sv.renderFir(plan))
           : (kind == 'iir' ? vhdl.renderIir(plan) : vhdl.renderFir(plan));
-      await File(path).writeAsString(source);
-      if (!controller.wantTestbench) {
-        _say(messenger, 'Wrote $path');
-        return;
-      }
-      final tbPath = path.endsWith(dot)
-          ? '${path.substring(0, path.length - dot.length)}_tb$dot'
-          : '${path}_tb$dot';
-      await File(tbPath).writeAsString(verilog
-          ? sv.testbenchForPlan(plan)
-          : vhdl.testbenchForPlan(plan));
-      _say(messenger,
-          'Wrote $path and ${tbPath.split(Platform.pathSeparator).last}');
+      bench = controller.wantTestbench
+          ? (verilog ? sv.testbenchForPlan(plan) : vhdl.testbenchForPlan(plan))
+          : null;
     } on RtlError catch (e) {
       _say(messenger, e.message, error: true);
+      return;
+    } catch (e) {
+      _say(messenger, 'Cannot generate this: $e', error: true);
+      return;
+    }
+
+    final directory = await getDirectoryPath(
+        confirmButtonText: 'Write here');
+    if (directory == null) return;
+
+    final separator = Platform.pathSeparator;
+    final files = <String, String>{
+      '$directory$separator$name.$suffix': source,
+      '$directory$separator${name}_tb.$suffix': ?bench,
+    };
+
+    // A save panel asks before it replaces something; a folder gives no such
+    // warning, so the question has to be asked here rather than not at all.
+    final existing = files.keys.where((p) => File(p).existsSync()).toList();
+    if (existing.isNotEmpty && context.mounted) {
+      final replace = await _confirmReplace(context, existing, separator);
+      if (replace != true) return;
+    }
+
+    try {
+      for (final entry in files.entries) {
+        await File(entry.key).writeAsString(entry.value);
+      }
+      _say(
+          messenger,
+          'Wrote ${files.keys.map((p) => p.split(separator).last).join(' and ')}'
+          ' to $directory');
     } catch (e) {
       _say(messenger, 'Save failed: $e', error: true);
     }
   }
+
+  /// Ask before overwriting, naming what would go.
+  Future<bool?> _confirmReplace(
+          BuildContext context, List<String> paths, String separator) =>
+      showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(paths.length == 1
+              ? 'Replace ${paths.first.split(separator).last}?'
+              : 'Replace ${paths.length} files?'),
+          content: Text(paths.length == 1
+              ? 'That file is already in this folder.'
+              : '${paths.map((p) => p.split(separator).last).join(' and ')} '
+                  'are already in this folder.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Replace'),
+            ),
+          ],
+        ),
+      );
 
   /// Why the two RTL buttons are, or are not, available.
   String _rtlHint(DesignController c) => c.isFixed
@@ -791,7 +849,7 @@ class _Controls extends StatelessWidget {
                   _Field(
                     label: 'Samples',
                     value: '${c.signalLength}',
-                    width: 104,
+                    minWidth: 104,
                     onSubmitted: (v) {
                       final n = int.tryParse(v);
                       if (n != null) c.update(() => c.signalLength = n);
@@ -802,7 +860,7 @@ class _Controls extends StatelessWidget {
                     _Field(
                       label: 'Frequency',
                       value: c.signalFrequency,
-                      width: 116,
+                      minWidth: 116,
                       onSubmitted: (v) =>
                           c.update(() => c.signalFrequency = v),
                     ),
@@ -972,13 +1030,21 @@ class _Field extends StatefulWidget {
     required this.label,
     required this.value,
     required this.onSubmitted,
-    this.width = 90,
+    this.minWidth = 90,
     this.enabled = true,
   });
   final String label;
   final String value;
   final ValueChanged<String> onSubmitted;
-  final double width;
+
+  /// How narrow the field may be, not how wide it will be.
+  ///
+  /// A field is never narrower than its own label needs, so for anything
+  /// longer than a word or two this is not the width that gets used -- see
+  /// [_widthForLabel]. It is a floor, and naming it one keeps the numbers at
+  /// the call sites from reading as measurements that were chosen and are
+  /// being honoured.
+  final double minWidth;
 
   /// A greyed-out field still shows its value, which is the point: the Weight
   /// and Spec columns swap places and you can see what the other one holds.
@@ -1007,7 +1073,7 @@ class _FieldState extends State<_Field> {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: math.max(widget.width, _widthForLabel(context, widget.label)),
+      width: math.max(widget.minWidth, _widthForLabel(context, widget.label)),
       child: Focus(
         onFocusChange: (has) {
           if (!has) widget.onSubmitted(text.text);
@@ -1119,7 +1185,7 @@ class _FirPanel extends StatelessWidget {
                 _Field(
                   label: 'Taps',
                   value: '${c.numtaps}',
-                  width: 80,
+                  minWidth: 80,
                   onSubmitted: (v) {
                     final n = int.tryParse(v);
                     if (n != null) c.update(() => c.numtaps = n);
@@ -1128,7 +1194,7 @@ class _FirPanel extends StatelessWidget {
                 _Field(
                   label: 'Sample rate',
                   value: _short(c.fs),
-                  width: 120,
+                  minWidth: 120,
                   onSubmitted: (v) {
                     final f = double.tryParse(v);
                     if (f != null) c.setSampleRate(f);
@@ -1137,7 +1203,7 @@ class _FirPanel extends StatelessWidget {
                 _Field(
                   label: 'Grid density',
                   value: '${c.gridDensity}',
-                  width: 104,
+                  minWidth: 104,
                   onSubmitted: (v) {
                     final n = int.tryParse(v);
                     if (n != null) c.update(() => c.gridDensity = n);
@@ -1146,7 +1212,7 @@ class _FirPanel extends StatelessWidget {
                 _Field(
                   label: 'Max iters',
                   value: '${c.maxiter}',
-                  width: 92,
+                  minWidth: 92,
                   onSubmitted: (v) {
                     final n = int.tryParse(v);
                     if (n != null) c.update(() => c.maxiter = n);
@@ -1196,7 +1262,7 @@ class _FirPanel extends StatelessWidget {
                     child: _Field(
                       label: 'Kaiser beta',
                       value: c.kaiserBeta,
-                      width: 116,
+                      minWidth: 116,
                       onSubmitted: (v) => c.update(() => c.kaiserBeta = v),
                     ),
                   ),
@@ -1250,13 +1316,13 @@ class _FirPanel extends StatelessWidget {
                   _Field(
                     label: 'Passband edge',
                     value: c.halfBandEdge,
-                    width: 132,
+                    minWidth: 132,
                     onSubmitted: (v) => c.update(() => c.halfBandEdge = v),
                   ),
                 _Field(
                   label: 'Rate factor',
                   value: '${c.rateFactor}',
-                  width: 104,
+                  minWidth: 104,
                   onSubmitted: (v) {
                     final n = int.tryParse(v);
                     if (n != null && n >= 1) c.update(() => c.rateFactor = n);
@@ -1306,38 +1372,38 @@ class _FirPanel extends StatelessWidget {
                         _Field(
                             label: 'F start',
                             value: c.rows[i].f1,
-                            width: 70,
+                            minWidth: 70,
                             onSubmitted: (v) =>
                                 c.update(() => c.rows[i].f1 = v)),
                         _Field(
                             label: 'F stop',
                             value: c.rows[i].f2,
-                            width: 70,
+                            minWidth: 70,
                             onSubmitted: (v) =>
                                 c.update(() => c.rows[i].f2 = v)),
                         _Field(
                             label: 'D at start',
                             value: c.rows[i].d1,
-                            width: 82,
+                            minWidth: 82,
                             onSubmitted: (v) =>
                                 c.update(() => c.rows[i].d1 = v)),
                         _Field(
                             label: 'D at stop',
                             value: c.rows[i].d2,
-                            width: 82,
+                            minWidth: 82,
                             onSubmitted: (v) =>
                                 c.update(() => c.rows[i].d2 = v)),
                         _Field(
                             label: 'Weight',
                             value: c.rows[i].weight,
-                            width: 64,
+                            minWidth: 64,
                             enabled: !c.useSpec,
                             onSubmitted: (v) =>
                                 c.update(() => c.rows[i].weight = v)),
                         _Field(
                             label: 'Spec (dB)',
                             value: c.rows[i].spec,
-                            width: 72,
+                            minWidth: 72,
                             enabled: c.useSpec,
                             onSubmitted: (v) =>
                                 c.update(() => c.rows[i].spec = v)),
@@ -1459,7 +1525,7 @@ class _IirPanel extends StatelessWidget {
                 _Field(
                   label: 'Order',
                   value: '${c.order}',
-                  width: 76,
+                  minWidth: 76,
                   onSubmitted: (v) {
                     final n = int.tryParse(v);
                     if (n != null) {
@@ -1474,7 +1540,7 @@ class _IirPanel extends StatelessWidget {
               _Field(
                 label: 'Sample rate',
                 value: _short(c.fs),
-                width: 130,
+                minWidth: 130,
                 onSubmitted: (v) {
                   final f = double.tryParse(v);
                   if (f != null) c.setSampleRate(f);
@@ -1490,26 +1556,26 @@ class _IirPanel extends StatelessWidget {
               _Field(
                 label: 'Passband ${c.edgeCount > 1 ? i + 1 : ''}'.trim(),
                 value: c.wp[i],
-                width: 96,
+                minWidth: 96,
                 onSubmitted: (v) => c.update(() => c.wp[i] = v),
               ),
             for (var i = 0; i < c.edgeCount; i++)
               _Field(
                 label: 'Stopband ${c.edgeCount > 1 ? i + 1 : ''}'.trim(),
                 value: c.ws[i],
-                width: 96,
+                minWidth: 96,
                 onSubmitted: (v) => c.update(() => c.ws[i] = v),
               ),
             _Field(
               label: 'Ripple dB',
               value: c.rp,
-              width: 96,
+              minWidth: 96,
               onSubmitted: (v) => c.update(() => c.rp = v),
             ),
             _Field(
               label: 'Atten. dB',
               value: c.rs,
-              width: 96,
+              minWidth: 96,
               onSubmitted: (v) => c.update(() => c.rs = v),
             ),
           ]),
@@ -1545,7 +1611,7 @@ class _ArithmeticPanel extends StatelessWidget {
               _Field(
                 label: 'Word bits',
                 value: '${c.wordBits}',
-                width: 92,
+                minWidth: 92,
                 onSubmitted: (v) {
                   final n = int.tryParse(v);
                   if (n != null) c.update(() => c.wordBits = n);
@@ -1554,7 +1620,7 @@ class _ArithmeticPanel extends StatelessWidget {
               _Field(
                 label: 'Headroom',
                 value: '${c.headroom}',
-                width: 92,
+                minWidth: 92,
                 onSubmitted: (v) {
                   final n = int.tryParse(v);
                   if (n != null) c.update(() => c.headroom = n);
@@ -1578,7 +1644,14 @@ class _ArithmeticPanel extends StatelessWidget {
               ),
             const Divider(height: 16),
             Text('Hardware', style: Theme.of(context).textTheme.labelLarge),
-            const SizedBox(height: 4),
+            const SizedBox(height: 8),
+            _Field(
+              label: 'Module name',
+              value: c.moduleName,
+              minWidth: 200,
+              onSubmitted: (v) => c.update(() => c.moduleName = v),
+            ),
+            const SizedBox(height: 8),
             DropdownButtonFormField<String>(
               initialValue: c.structure,
               isDense: true,
@@ -1808,7 +1881,21 @@ class _SignalPlot extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = controller;
     final run = c.signalRun();
-    if (run == null) return const SizedBox.shrink();
+    if (run == null) {
+      // A refusal has to be visible where the plot would have been. Drawing
+      // nothing at all would read as the feature being broken, and drawing a
+      // shorter run than was asked for would read as the answer.
+      final why = c.signalError;
+      if (why == null) return const SizedBox.shrink();
+      return LinePlot(
+        title: '${c.testSignal.label} through the filter',
+        traces: const [],
+        xLabel: 'sample',
+        yLabel: 'amplitude',
+        empty: why,
+        height: 140,
+      );
+    }
     final scheme = Theme.of(context).colorScheme;
 
     final index = Float64List(run.input.length);

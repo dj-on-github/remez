@@ -369,7 +369,7 @@ NoiseFloor noiseResponse(
   int frac,
   int wcoef,
   int headroom, {
-  int? length,
+  int? minLength,
   int seed = 12345,
 }) {
   if (frac < 0) {
@@ -380,8 +380,11 @@ NoiseFloor noiseResponse(
   // Checked here as well as in the simulators, because the drive level below
   // is worked out from the width before anything is run through it.
   checkDatapathWidth(wcoef, headroom);
+  // Eight half-overlapping segments is the fewest the averaging can work
+  // with, so a shorter run than that is raised rather than refused -- which
+  // is why the parameter is a floor and is named one.
   const segment = 512;
-  final n = math.max(length ?? 1 << 14, 8 * segment);
+  final n = math.max(minLength ?? 1 << 14, 8 * segment);
 
   final rng = math.Random(seed);
   final full = (1 << (wcoef + headroom - 1)) - 1;

@@ -335,7 +335,15 @@ class _Grid {
     if (bands.isEmpty) throw RemezError('a design needs at least one band');
     final total = bands.fold<double>(0, (sum, b) => sum + (b.f2 - b.f1));
     if (!(total > 0)) throw RemezError('the bands have no width between them');
-    final wanted = math.max(gridDensity * numtaps, 4 * numtaps);
+    // The exchange takes `gridDensity * r` points and no more, because a
+    // search only needs enough resolution to find the peaks. Least squares
+    // has to *solve* for the taps, and with fewer equations than unknowns the
+    // normal equations are singular -- so here the density is a request with
+    // a floor under it, and the floor is the thing that makes the answer
+    // exist rather than a preference about accuracy. Four points per tap is
+    // comfortably clear of the half a point per tap where it would fail.
+    final minimumForSolvable = 4 * numtaps;
+    final wanted = math.max(gridDensity * numtaps, minimumForSolvable);
 
     final f = <double>[];
     final desired = <double>[];
