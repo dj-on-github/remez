@@ -19,6 +19,7 @@ import 'src/c_export.dart';
 import 'src/cli.dart';
 import 'src/coeff_export.dart';
 import 'src/labels.dart';
+import 'src/menus.dart';
 import 'src/controller.dart';
 import 'src/design_view.dart';
 import 'src/fir_core.dart' as fir;
@@ -188,22 +189,113 @@ class _DesignerPageState extends State<DesignerPage> {
 
   @override
   Widget build(BuildContext context) {
-    // Bound here rather than in a menu bar: the whole program is one window
-    // with one document, and these are the only two shortcuts it has.
     return CallbackShortcuts(
-      bindings: {
-        const SingleActivator(LogicalKeyboardKey.keyZ, meta: true):
-            controller.undo,
-        const SingleActivator(LogicalKeyboardKey.keyZ, control: true):
-            controller.undo,
-        const SingleActivator(LogicalKeyboardKey.keyZ,
-            meta: true, shift: true): controller.redo,
-        const SingleActivator(LogicalKeyboardKey.keyZ,
-            control: true, shift: true): controller.redo,
-      },
-      child: Focus(autofocus: true, child: _scaffold(context)),
+      bindings: undoShortcuts(controller.undo, controller.redo),
+      child: Focus(
+        autofocus: true,
+        child: hasPlatformMenuBar
+            ? PlatformMenuBar(
+                menus: designerMenus(menuActions(context)),
+                child: _scaffold(context),
+              )
+            : _scaffold(context),
+      ),
     );
   }
+
+  /// The menu bar's commands, which are the window's own.
+  ///
+  /// Handed the same callbacks the buttons use and the same conditions for
+  /// being greyed out, so a menu item cannot end up offering something the
+  /// button beside it refuses.
+  ///
+  /// Public on a private class, like [controller] and for the same reason:
+  /// `menus_test.dart` reads it back and checks each item against the button
+  /// that does the same thing.
+  MenuActions menuActions(BuildContext context) {
+    final c = controller;
+    final files = FileCommands(c);
+    final canExportRtl = c.hasResult && c.isFixed;
+    return MenuActions(
+      settings: () => _showSettings(context),
+      open: () => files._openDesign(context),
+      save: () => files._saveDesign(context),
+      exportC: c.hasResult ? () => files._saveC(context) : null,
+      exportVerilog:
+          canExportRtl ? () => files._saveRtl(context, verilog: true) : null,
+      exportVhdl:
+          canExportRtl ? () => files._saveRtl(context, verilog: false) : null,
+      undo: c.canUndo ? c.undo : null,
+      // Cut, copy and paste belong to whatever has the caret, not to this
+      // page, so they are handed to it rather than acted on here. Without a
+      // text field focused there is nothing to hand them to and they do
+      // nothing, which is what the same keys already do.
+      cut: () => _editText(const CopySelectionTextIntent.cut(
+          SelectionChangedCause.keyboard)),
+      copy: () => _editText(CopySelectionTextIntent.copy),
+      paste: () => _editText(
+          const PasteTextIntent(SelectionChangedCause.keyboard)),
+    );
+  }
+
+  void _editText(Intent intent) {
+    final focused = primaryFocus?.context;
+    if (focused == null) return;
+    final action = Actions.maybeFind<Intent>(focused, intent: intent);
+    if (action != null) {
+      Actions.of(focused).invokeAction(action, intent, focused);
+    }
+  }
+
+  /// The one setting that is not a property of the filter.
+  ///
+  /// Everything else this program can be told is part of the design and is
+  /// saved with it, so it lives in the panel it belongs to rather than in a
+  /// preferences window that would be a second place to look.
+  Future<void> _showSettings(BuildContext context) => showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Settings'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Appearance'),
+              const SizedBox(height: 8),
+              StatefulBuilder(
+                builder: (context, rebuild) => SegmentedButton<Appearance>(
+                  showSelectedIcon: false,
+                  segments: const [
+                    ButtonSegment(
+                        value: Appearance.system, label: Text('Auto')),
+                    ButtonSegment(
+                        value: Appearance.light, label: Text('Light')),
+                    ButtonSegment(value: Appearance.dark, label: Text('Dark')),
+                  ],
+                  selected: {controller.appearance},
+                  onSelectionChanged: (v) {
+                    controller.update(() => controller.appearance = v.first);
+                    rebuild(() {});
+                  },
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'Everything else this program can be told is part of the '
+                'design and is saved with it, so it is in the panels rather '
+                'than here.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Done'),
+            ),
+          ],
+        ),
+      );
 
   Widget _scaffold(BuildContext context) {
     return Scaffold(
@@ -313,15 +405,16 @@ class _Splitter extends StatelessWidget {
 // the control column
 // ---------------------------------------------------------------------------
 
-class _Controls extends StatelessWidget {
-  const _Controls({required this.controller});
+/// Everything this program can write, and the dialogs that ask where.
+///
+/// Lifted out of the File panel when the menu bar arrived and needed the
+/// same commands. A widget is a bad place to keep them: reaching them from
+/// anywhere else would mean building one. This holds a controller and takes
+/// a context for the dialogs, which is all the panel ever gave it.
+class FileCommands {
+  const FileCommands(this.controller);
   final DesignController controller;
 
-  /// Report the outcome of a save or an open.
-  ///
-  /// The messenger is looked up before the file dialog, not after: the dialog
-  /// is an await, and a context is not guaranteed to still be mounted on the
-  /// other side of one. Holding the messenger itself sidesteps the question.
   void _say(ScaffoldMessengerState messenger, String message,
       {bool error = false}) {
     messenger.showSnackBar(SnackBar(
@@ -541,12 +634,6 @@ class _Controls extends StatelessWidget {
         ),
       );
 
-  /// Why the two RTL buttons are, or are not, available.
-  String _rtlHint(DesignController c) => c.isFixed
-      ? 'RTL and a testbench for the structure chosen in the Arithmetic panel'
-      : 'Hardware needs fixed-point coefficients: choose Fixed in the '
-          'Arithmetic panel';
-
   /// The coefficients on their own, as CSV or a C header.
   Future<void> _saveCoefficients(BuildContext context) async {
     final messenger = ScaffoldMessenger.of(context);
@@ -607,6 +694,27 @@ class _Controls extends StatelessWidget {
       _say(messenger, 'Save failed: $e', error: true);
     }
   }
+}
+
+class _Controls extends StatelessWidget {
+  const _Controls({required this.controller});
+  final DesignController controller;
+
+  /// Report the outcome of a save or an open.
+  ///
+  /// The messenger is looked up before the file dialog, not after: the dialog
+  /// is an await, and a context is not guaranteed to still be mounted on the
+  /// other side of one. Holding the messenger itself sidesteps the question.
+  /// The commands the buttons below run, which the menu bar runs too.
+  /// Held rather than duplicated so there is one implementation of each
+  /// and two ways to reach it.
+  FileCommands get _files => FileCommands(controller);
+
+  /// Why the two RTL buttons are, or are not, available.
+  String _rtlHint(DesignController c) => c.isFixed
+      ? 'RTL and a testbench for the structure chosen in the Arithmetic panel'
+      : 'Hardware needs fixed-point coefficients: choose Fixed in the '
+          'Arithmetic panel';
 
   @override
   Widget build(BuildContext context) {
@@ -637,14 +745,14 @@ class _Controls extends StatelessWidget {
               Row(children: [
                 Expanded(
                   child: OutlinedButton(
-                    onPressed: () => _openDesign(context),
+                    onPressed: () => _files._openDesign(context),
                     child: const Text('Open design…'),
                   ),
                 ),
                 const SizedBox(width: 6),
                 Expanded(
                   child: OutlinedButton(
-                    onPressed: () => _saveDesign(context),
+                    onPressed: () => _files._saveDesign(context),
                     child: const Text('Save design…'),
                   ),
                 ),
@@ -654,14 +762,14 @@ class _Controls extends StatelessWidget {
                 Expanded(
                   child: OutlinedButton(
                     onPressed:
-                        c.hasResult ? () => _saveCoefficients(context) : null,
+                        c.hasResult ? () => _files._saveCoefficients(context) : null,
                     child: const Text('Save coefficients…'),
                   ),
                 ),
                 const SizedBox(width: 6),
                 Expanded(
                   child: OutlinedButton(
-                    onPressed: c.hasResult ? () => _savePlot(context) : null,
+                    onPressed: c.hasResult ? () => _files._savePlot(context) : null,
                     child: const Text('Save plot…'),
                   ),
                 ),
@@ -673,7 +781,7 @@ class _Controls extends StatelessWidget {
                     message: 'A NumPy module or a MATLAB function, by the '
                         'extension you give it: .py or .m',
                     child: OutlinedButton(
-                      onPressed: c.hasResult ? () => _saveScript(context) : null,
+                      onPressed: c.hasResult ? () => _files._saveScript(context) : null,
                       child: const Text('Save script…'),
                     ),
                   ),
@@ -684,7 +792,7 @@ class _Controls extends StatelessWidget {
                     message: _rtlHint(c),
                     child: OutlinedButton(
                       onPressed: c.hasResult && c.isFixed
-                          ? () => _saveIntC(context)
+                          ? () => _files._saveIntC(context)
                           : null,
                       child: const Text('Save integer C…'),
                     ),
@@ -695,7 +803,7 @@ class _Controls extends StatelessWidget {
               Row(children: [
                 Expanded(
                   child: OutlinedButton(
-                    onPressed: c.hasResult ? () => _saveC(context) : null,
+                    onPressed: c.hasResult ? () => _files._saveC(context) : null,
                     child: const Text('Save C…'),
                   ),
                 ),
@@ -705,7 +813,7 @@ class _Controls extends StatelessWidget {
                     message: _rtlHint(c),
                     child: OutlinedButton(
                       onPressed: c.hasResult && c.isFixed
-                          ? () => _saveRtl(context, verilog: true)
+                          ? () => _files._saveRtl(context, verilog: true)
                           : null,
                       child: const Text('Generate SV…'),
                     ),
@@ -719,7 +827,7 @@ class _Controls extends StatelessWidget {
                     message: _rtlHint(c),
                     child: OutlinedButton(
                       onPressed: c.hasResult && c.isFixed
-                          ? () => _saveRtl(context, verilog: false)
+                          ? () => _files._saveRtl(context, verilog: false)
                           : null,
                       child: const Text('Generate VHDL…'),
                     ),

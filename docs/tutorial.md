@@ -276,9 +276,25 @@ edit another against it — the way to answer "is 61 taps really buying me
 anything here?" without alt-tabbing between screenshots. The button turns into
 **Unpin** and names what it is holding.
 
-The two arrows in the title bar are undo and redo, on ⌘Z and ⇧⌘Z. They step
+The two arrows in the title bar are undo and redo, on ⌘Z and ⇧⌘Z (**Edit →
+Undo** on macOS, where the menu owns that key). They step
 through complete designs, not individual keystrokes, and reach everything the
 save file reaches.
+
+### The menu bar, on macOS
+
+A Mac build puts its commands in the bar at the top of the screen as well as in
+the panels: **remez** (About, Settings…, Hide, Show All, Quit), **File** (Open…,
+Save…, Export C…, Export SystemVerilog…, Export VHDL…) and **Edit** (Undo, Cut,
+Copy, Paste). They run the same handlers the buttons run and grey out under the
+same conditions, so a menu item never offers what the button beside it refuses.
+
+**Settings…** holds the appearance, which is the one thing this program can be
+told that is not part of a filter. Everything else is saved with the design, so
+it lives in the panel it belongs to.
+
+No other platform has a menu bar here: the window is the whole interface, and
+⌘Z is bound inside it instead.
 
 ### Signal
 
