@@ -852,7 +852,56 @@ class DesignController extends ChangeNotifier {
   /// Not from delta: that is the *weighted* deviation, and once the weights
   /// come from dB specs it is essentially the passband's number, which would
   /// cut the stopband off the bottom of the plot.
-  double magnitudeFloor() {
+  double magnitudeFloor() =>
+      (_automaticFloor() + floorAdjustDb).clamp(deepestFloorDb, shallowestFloorDb);
+
+  /// How far the magnitude plot's floor has been moved from where it would
+  /// put itself, in dB. Negative reaches further down.
+  ///
+  /// The automatic floor is worked out from what each band was asked to
+  /// achieve, which is the right guess for a design that holds its bands
+  /// evenly and the wrong one for a design that does not: a least-squares
+  /// stopband keeps falling away from the transition, so the part worth
+  /// looking at is below the deepest thing the bands were measured against
+  /// and the curve runs off the bottom of the frame. Rather than guess
+  /// harder, the guess can be overridden.
+  double floorAdjustDb = 0;
+
+  /// One press of the buttons beside the plot.
+  static const double floorStepDb = 20;
+
+  /// As far down and as far up as the floor will go.
+  static const double deepestFloorDb = -260;
+  static const double shallowestFloorDb = -10;
+
+  bool get canLowerFloor => magnitudeFloor() > deepestFloorDb;
+  bool get canRaiseFloor => magnitudeFloor() < shallowestFloorDb;
+
+  /// Reach further down, so a response that runs off the bottom comes back.
+  void lowerFloor() => _moveFloor(-floorStepDb);
+
+  /// Come back up, which is also how to look closely at a passband.
+  void raiseFloor() => _moveFloor(floorStepDb);
+
+  /// Put the floor back where the design would have put it.
+  void resetFloor() {
+    if (floorAdjustDb == 0) return;
+    floorAdjustDb = 0;
+    notifyListeners();
+  }
+
+  void _moveFloor(double by) {
+    // Measured from where the floor actually is rather than from the stored
+    // adjustment, so that a press always moves the frame by one step even
+    // after the clamp has swallowed some of the adjustment.
+    final was = magnitudeFloor();
+    final want = (was + by).clamp(deepestFloorDb, shallowestFloorDb);
+    if (want == was) return;
+    floorAdjustDb += want - was;
+    notifyListeners();
+  }
+
+  double _automaticFloor() {
     if (isIir) {
       final res = iirEffective!;
       return math.max(math.min(-1.6 * res.rs - 20.0, -20.0), -220.0);
@@ -1310,6 +1359,7 @@ class DesignController extends ChangeNotifier {
       'signal_length': signalLength,
       'group_delay': showGroupDelay,
       'zplane': showZPlane,
+      'floor_adjust_db': floorAdjustDb,
     };
     return {
       'format': formatName,
@@ -1490,6 +1540,8 @@ class DesignController extends ChangeNotifier {
     signalLength = read<num>(display, 'signal_length')?.toInt() ?? signalLength;
     showGroupDelay = read<bool>(display, 'group_delay') ?? showGroupDelay;
     showZPlane = read<bool>(display, 'zplane') ?? showZPlane;
+    floorAdjustDb =
+        read<num>(display, 'floor_adjust_db')?.toDouble() ?? floorAdjustDb;
 
     final mode0 = read<String>(state, 'mode');
     if (mode0 != null) {

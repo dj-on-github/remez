@@ -229,9 +229,11 @@ class _AntiAliasTolerant extends LocalFileComparator {
     if (offending == 0) return true;
 
     // Write the same failure images the stock comparator would, so a real
-    // difference can be looked at rather than only counted.
-    await GoldenFileComparator.compareLists(
+    // difference can be looked at rather than only counted. Pointing at
+    // files without producing them would be worse than not mentioning them.
+    final result = await GoldenFileComparator.compareLists(
         imageBytes, await getGoldenBytes(golden));
+    await generateFailureOutput(result, golden, basedir);
     throw FlutterError('Golden "$golden": $offending pixel(s) differ by more '
         'than $_tolerance of 255 (worst $worst). See test/failures.');
   }

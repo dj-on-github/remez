@@ -106,6 +106,7 @@ class LinePlot extends StatelessWidget {
     this.yRange,
     this.height = 220,
     this.empty,
+    this.trailing,
   });
 
   final String title;
@@ -125,6 +126,13 @@ class LinePlot extends StatelessWidget {
   /// empty frame that looks like a bug.
   final String? empty;
 
+  /// Controls for this plot, on the end of its title row.
+  ///
+  /// Beside the plot they act on rather than in a panel on the other side of
+  /// the window: what they do is only meaningful while looking at the frame
+  /// they change.
+  final Widget? trailing;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -133,7 +141,14 @@ class LinePlot extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title, style: theme.textTheme.labelLarge),
+          Row(
+            children: [
+              Expanded(
+                child: Text(title, style: theme.textTheme.labelLarge),
+              ),
+              ?trailing,
+            ],
+          ),
           SizedBox(
             height: height,
             child: CustomPaint(

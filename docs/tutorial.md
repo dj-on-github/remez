@@ -61,6 +61,15 @@ narrower transition costs taps.
 - **Ripple dB** is the peak-to-peak wobble allowed across the passband.
 - **Atten. dB** is how far down the stopband is held.
 
+**The vertical range.** The plot works out how far down to reach from what the
+bands were asked to achieve. That is the right guess for a design that holds
+its bands evenly, and the wrong one for a design that does not — a
+least-squares stopband keeps falling away from the transition, so the part
+worth reading ends up below the bottom of the frame. The **floor** readout and
+the two chevrons beside the plot's title move it 20 dB at a time, and the third
+button puts it back where the design would have put it. The setting is saved
+with the design.
+
 The ripple is equal across the whole band and the stopband lobes are all the
 same height. That is what "equiripple" means and it is the point of the Remez
 exchange: for a given number of taps, no filter has a smaller worst-case error.

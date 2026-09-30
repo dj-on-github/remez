@@ -1965,6 +1965,9 @@ class _Plots extends StatelessWidget {
           xRange: (0, c.fs / 2),
           yRange: c.logScale ? (floor, top) : null,
           height: 300,
+          // Only on the decibel axis: a linear plot is fitted to the trace
+          // and has no floor to move.
+          trailing: c.logScale ? _FloorButtons(controller: c) : null,
         ),
         if (!c.isIir) _DetailPlot(controller: c),
         if (!c.isIir) _ErrorPlot(controller: c),
@@ -2040,6 +2043,63 @@ class _SignalPlot extends StatelessWidget {
       yLabel: 'amplitude',
       xRange: (0, (run.input.length - 1).toDouble()),
       height: 220,
+    );
+  }
+}
+
+/// How far down the magnitude plot reaches, and the two presses that change
+/// it.
+///
+/// The automatic floor comes from what the bands were asked to achieve, which
+/// is a good guess right up until the response goes somewhere the bands were
+/// not measured -- a least-squares stopband keeps falling away from the
+/// transition and disappears off the bottom of the frame. These put it back
+/// without anyone having to work out why.
+class _FloorButtons extends StatelessWidget {
+  const _FloorButtons({required this.controller});
+  final DesignController controller;
+
+  /// Sized to the title beside them rather than to the usual tap target.
+  ///
+  /// A default [IconButton] is forty-eight pixels tall, which would push the
+  /// title row -- and every plot under it -- down the pane. These controls
+  /// are worth a line of their own nowhere, so they are made to fit the line
+  /// that is already there.
+  static const double _side = 22;
+
+  Widget _button(IconData icon, String tooltip, VoidCallback? onPressed) =>
+      IconButton(
+        icon: Icon(icon, size: 16),
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints.tightFor(width: _side, height: _side),
+        // Both are needed. The constraints alone leave the forty-eight pixel
+        // tap target Material puts around every icon button, which is what
+        // was pushing the row -- and every plot under it -- down the pane.
+        style: IconButton.styleFrom(
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+        visualDensity: VisualDensity.compact,
+        tooltip: tooltip,
+        onPressed: onPressed,
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final c = controller;
+    final step = DesignController.floorStepDb.round();
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text('floor ${c.magnitudeFloor().round()} dB',
+            style: Theme.of(context).textTheme.bodySmall),
+        const SizedBox(width: 4),
+        _button(Icons.expand_more, 'Reach $step dB further down',
+            c.canLowerFloor ? c.lowerFloor : null),
+        _button(Icons.expand_less, 'Come $step dB back up',
+            c.canRaiseFloor ? c.raiseFloor : null),
+        _button(Icons.settings_backup_restore,
+            'Back to the range the design chooses',
+            c.floorAdjustDb == 0 ? null : c.resetFloor),
+      ],
     );
   }
 }
